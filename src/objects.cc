@@ -57,6 +57,7 @@
 #include "src/string-builder.h"
 #include "src/string-search.h"
 #include "src/string-stream.h"
+#include "src/taint_tracking.h"
 #include "src/utils.h"
 #include "src/zone.h"
 
@@ -1345,7 +1346,7 @@ MaybeHandle<Object> Object::GetPropertyWithAccessor(LookupIterator* it) {
   if (getter->IsFunctionTemplateInfo()) {
     return Builtins::InvokeApiFunction(
         isolate, Handle<FunctionTemplateInfo>::cast(getter), receiver, 0,
-        nullptr);
+        nullptr, tainttracking::FrameType::GETTER_ACCESSOR);
   } else if (getter->IsCallable()) {
     // TODO(rossberg): nicer would be to cast to some JSCallable here...
     return Object::GetPropertyWithDefinedGetter(
@@ -1414,10 +1415,17 @@ Maybe<bool> Object::SetPropertyWithAccessor(LookupIterator* it,
           Nothing<bool>());
     }
 
+    tainttracking::RuntimePrepareSymbolicStackFrame(
+        isolate, tainttracking::FrameType::SETTER_ACCESSOR);
     PropertyCallbackArguments args(isolate, info->data(), *receiver, *holder,
                                    should_throw);
+    tainttracking::RuntimeAddLiteralArgumentToStackFrame(isolate, value);
+    tainttracking::RuntimeSetReceiver(
+        isolate, holder, handle(isolate->heap()->undefined_value(), isolate));
+    tainttracking::RuntimeEnterSymbolicStackFrame(isolate);
     args.Call(call_fun, name, value);
     RETURN_VALUE_IF_SCHEDULED_EXCEPTION(isolate, Nothing<bool>());
+    tainttracking::RuntimeExitSymbolicStackFrame(isolate);
     return Just(true);
   }
 
@@ -1427,8 +1435,12 @@ Maybe<bool> Object::SetPropertyWithAccessor(LookupIterator* it,
     Handle<Object> argv[] = {value};
     RETURN_ON_EXCEPTION_VALUE(
         isolate, Builtins::InvokeApiFunction(
-                     isolate, Handle<FunctionTemplateInfo>::cast(setter),
-                     receiver, arraysize(argv), argv),
+                     isolate,
+                     Handle<FunctionTemplateInfo>::cast(setter),
+                     receiver,
+                     arraysize(argv),
+                     argv,
+                     tainttracking::FrameType::SETTER_ACCESSOR),
         Nothing<bool>());
     return Just(true);
   } else if (setter->IsCallable()) {
@@ -1462,7 +1474,9 @@ MaybeHandle<Object> Object::GetPropertyWithDefinedGetter(
     return MaybeHandle<Object>();
   }
 
-  return Execution::Call(isolate, getter, receiver, 0, NULL);
+  return Execution::Call(
+      isolate, getter, receiver, 0, NULL,
+      tainttracking::FrameType::GETTER_ACCESSOR);
 }
 
 
@@ -1473,9 +1487,15 @@ Maybe<bool> Object::SetPropertyWithDefinedSetter(Handle<Object> receiver,
   Isolate* isolate = setter->GetIsolate();
 
   Handle<Object> argv[] = { value };
-  RETURN_ON_EXCEPTION_VALUE(isolate, Execution::Call(isolate, setter, receiver,
-                                                     arraysize(argv), argv),
-                            Nothing<bool>());
+  RETURN_ON_EXCEPTION_VALUE(
+      isolate,
+      Execution::Call(isolate,
+                      setter,
+                      receiver,
+                      arraysize(argv),
+                      argv,
+                      tainttracking::FrameType::SETTER_ACCESSOR),
+      Nothing<bool>());
   return Just(true);
 }
 
@@ -2115,12 +2135,14 @@ Handle<String> String::SlowFlatten(Handle<ConsString> cons,
     DisallowHeapAllocation no_gc;
     WriteToFlat(*cons, flat->GetChars(), 0, length);
     result = flat;
+    tainttracking::OnNewSubStringCopy(*cons, *result, 0, length);
   } else {
     Handle<SeqTwoByteString> flat = isolate->factory()->NewRawTwoByteString(
         length, tenure).ToHandleChecked();
     DisallowHeapAllocation no_gc;
     WriteToFlat(*cons, flat->GetChars(), 0, length);
     result = flat;
+    tainttracking::OnNewSubStringCopy(*cons, *result, 0, length);
   }
   cons->set_first(*result);
   cons->set_second(isolate->heap()->empty_string());
@@ -2141,9 +2163,15 @@ bool String::MakeExternal(v8::String::ExternalStringResource* resource) {
     DCHECK(static_cast<size_t>(this->length()) == resource->length());
     ScopedVector<uc16> smart_chars(this->length());
     String::WriteToFlat(this, smart_chars.start(), 0, this->length());
+    ScopedVector<uint8_t> smart_taint(this->length());
     DCHECK(memcmp(smart_chars.start(),
                   resource->data(),
                   resource->length() * sizeof(smart_chars[0])) == 0);
+    tainttracking::FlattenTaintData(this, smart_taint.start(),
+                                    0, this->length());
+    DCHECK_EQ(memcmp(smart_taint.start(),
+                     resource->GetTaintChars(),
+                     this->length() * sizeof(tainttracking::TaintData)), 0);
   }
 #endif  // DEBUG
   int size = this->Size();  // Byte size of the original string.
@@ -2178,6 +2206,7 @@ bool String::MakeExternal(v8::String::ExternalStringResource* resource) {
 
   // Byte size of the external String object.
   int new_size = this->SizeFromMap(new_map);
+  DCHECK_GE(size, new_size);
   heap->CreateFillerObjectAt(this->address() + new_size, size - new_size,
                              ClearRecordedSlots::kNo);
 
@@ -2190,6 +2219,7 @@ bool String::MakeExternal(v8::String::ExternalStringResource* resource) {
   if (is_internalized) self->Hash();  // Force regeneration of the hash value.
 
   heap->AdjustLiveBytes(this, new_size - size, Heap::CONCURRENT_TO_SWEEPER);
+
   return true;
 }
 
@@ -2210,9 +2240,15 @@ bool String::MakeExternal(v8::String::ExternalOneByteStringResource* resource) {
     }
     ScopedVector<char> smart_chars(this->length());
     String::WriteToFlat(this, smart_chars.start(), 0, this->length());
+    ScopedVector<uint8_t> smart_taint(this->length());
     DCHECK(memcmp(smart_chars.start(),
                   resource->data(),
                   resource->length() * sizeof(smart_chars[0])) == 0);
+    tainttracking::FlattenTaintData(this, smart_taint.start(),
+                                      0, this->length());
+    DCHECK_EQ(memcmp(smart_taint.start(),
+                     resource->GetTaintChars(),
+                     this->length() * sizeof(tainttracking::TaintData)), 0);
   }
 #endif  // DEBUG
   int size = this->Size();  // Byte size of the original string.
@@ -2240,6 +2276,7 @@ bool String::MakeExternal(v8::String::ExternalOneByteStringResource* resource) {
 
   // Byte size of the external String object.
   int new_size = this->SizeFromMap(new_map);
+  DCHECK_GE(size, new_size);
   heap->CreateFillerObjectAt(this->address() + new_size, size - new_size,
                              ClearRecordedSlots::kNo);
 
@@ -2252,6 +2289,7 @@ bool String::MakeExternal(v8::String::ExternalOneByteStringResource* resource) {
   if (is_internalized) self->Hash();  // Force regeneration of the hash value.
 
   heap->AdjustLiveBytes(this, new_size - size, Heap::CONCURRENT_TO_SWEEPER);
+
   return true;
 }
 
@@ -8220,8 +8258,10 @@ MaybeHandle<JSObject> JSObject::DeepCopy(
 }
 
 // static
-MaybeHandle<Object> JSReceiver::ToPrimitive(Handle<JSReceiver> receiver,
-                                            ToPrimitiveHint hint) {
+MaybeHandle<Object> JSReceiver::ToPrimitive(
+    Handle<JSReceiver> receiver,
+    ToPrimitiveHint hint,
+    tainttracking::FrameType frame_type) {
   Isolate* const isolate = receiver->GetIsolate();
   Handle<Object> exotic_to_prim;
   ASSIGN_RETURN_ON_EXCEPTION(
@@ -8233,7 +8273,11 @@ MaybeHandle<Object> JSReceiver::ToPrimitive(Handle<JSReceiver> receiver,
     Handle<Object> result;
     ASSIGN_RETURN_ON_EXCEPTION(
         isolate, result,
-        Execution::Call(isolate, exotic_to_prim, receiver, 1, &hint_string),
+
+        // TODO: mark with the tainttracking frame type, and add a way to
+        // prepare for the frame type in the ast_serialization code
+        Execution::Call(
+            isolate, exotic_to_prim, receiver, 1, &hint_string, frame_type),
         Object);
     if (result->IsPrimitive()) return result;
     THROW_NEW_ERROR(isolate,
@@ -11530,13 +11574,26 @@ Handle<String> SeqString::Truncate(Handle<SeqString> string, int new_length) {
   int old_length = string->length();
   if (old_length <= new_length) return string;
 
-  if (string->IsSeqOneByteString()) {
+  bool one_byte = string->IsSeqOneByteString();
+
+  if (one_byte) {
     old_size = SeqOneByteString::SizeFor(old_length);
     new_size = SeqOneByteString::SizeFor(new_length);
   } else {
     DCHECK(string->IsSeqTwoByteString());
     old_size = SeqTwoByteString::SizeFor(old_length);
     new_size = SeqTwoByteString::SizeFor(new_length);
+  }
+
+  byte taint_data[new_length];
+  if (one_byte) {
+    DisallowHeapAllocation no_gc;
+    tainttracking::CopyOut(
+        SeqOneByteString::cast(*string), taint_data, 0, new_length);
+  } else {
+    DisallowHeapAllocation no_gc;
+    tainttracking::CopyOut(
+        SeqTwoByteString::cast(*string), taint_data, 0, new_length);
   }
 
   int delta = old_size - new_size;
@@ -11557,6 +11614,16 @@ Handle<String> SeqString::Truncate(Handle<SeqString> string, int new_length) {
   string->synchronized_set_length(new_length);
 
   if (new_length == 0) return heap->isolate()->factory()->empty_string();
+
+  if (one_byte) {
+    DisallowHeapAllocation no_gc;
+    tainttracking::CopyIn(
+        SeqOneByteString::cast(*string), taint_data, 0, new_length);
+  } else {
+    DisallowHeapAllocation no_gc;
+    tainttracking::CopyIn(
+        SeqTwoByteString::cast(*string), taint_data, 0, new_length);
+  }
   return string;
 }
 
@@ -13445,6 +13512,13 @@ void SharedFunctionInfo::InitFromFunctionLiteral(
   shared_info->set_needs_home_object(lit->scope()->NeedsHomeObject());
   shared_info->set_asm_function(lit->scope()->asm_function());
   SetExpectedNofPropertiesFromEstimate(shared_info, lit);
+
+
+  Object* obj;
+  tainttracking::V8NodeLabelSerializer ser(shared_info->GetIsolate());
+  if (ser.Serialize(&obj, lit->GetTaintTrackingLabel())) {
+    shared_info->set_taint_node_label(obj);
+  }
 }
 
 
@@ -13821,6 +13895,25 @@ int AbstractCode::SourcePosition(int offset) {
   }
   return position;
 }
+
+int AbstractCode::SourcePositionWithTaintTrackingAstIndex(
+    int offset, int* out_ast_index) {
+  DCHECK_NOT_NULL(out_ast_index);
+  int position = 0;
+  int ast_index =
+    v8::internal::StackFrame::TaintStackFrameInfo::SOURCE_POS_DEFAULT;
+  // Subtract one because the current PC is one instruction after the call site.
+  if (IsCode()) offset--;
+  for (SourcePositionTableIterator iterator(source_position_table());
+       !iterator.done() && iterator.code_offset() <= offset;
+       iterator.Advance()) {
+    position = iterator.source_position();
+    ast_index = iterator.ast_taint_tracking_index();
+  }
+  *out_ast_index = ast_index;
+  return position;
+}
+
 
 int AbstractCode::SourceStatementPosition(int offset) {
   // First find the closest position.

@@ -16,6 +16,7 @@ Handle<Object> FunctionCallbackArguments::Call(FunctionCallback f) {
   VMState<EXTERNAL> state(isolate);
   ExternalCallbackScope call_scope(isolate, FUNCTION_ADDR(f));
   FunctionCallbackInfo<v8::Value> info(begin(), argv_, argc_);
+  DCHECK(tainttracking::SymbolicMatchesFunctionArgs(info));
   f(info);
   return GetReturnValue<Object>(isolate);
 }

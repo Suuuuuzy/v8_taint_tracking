@@ -2214,6 +2214,10 @@ void StringHelper::GenerateCopyCharacters(MacroAssembler* masm, Register dest,
 void SubStringStub::Generate(MacroAssembler* masm) {
   Label runtime;
 
+  // TODO: ideally, would code taint-tracking in assembly too.
+  // Taint tracking requires by-passing the sub-string assembly code.
+  __ j(not_zero, &runtime);
+
   // Stack frame on entry.
   //  lr: return address
   //  sp[0]: to

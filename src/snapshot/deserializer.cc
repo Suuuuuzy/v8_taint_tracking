@@ -10,6 +10,7 @@
 #include "src/isolate.h"
 #include "src/macro-assembler.h"
 #include "src/snapshot/natives.h"
+#include "src/taint_tracking.h"
 #include "src/v8.h"
 
 namespace v8 {
@@ -239,6 +240,7 @@ HeapObject* Deserializer::PostProcessNewObject(HeapObject* obj, int space) {
   if (deserializing_user_code()) {
     if (obj->IsString()) {
       String* string = String::cast(obj);
+      tainttracking::OnNewDeserializedString(string);
       // Uninitialize hash field as the hash seed may have changed.
       string->set_hash_field(String::kEmptyHashField);
       if (string->IsInternalizedString()) {
@@ -281,6 +283,10 @@ HeapObject* Deserializer::PostProcessNewObject(HeapObject* obj, int space) {
     if (deserializing_user_code() || space == LO_SPACE) {
       new_code_objects_.Add(Code::cast(obj));
     }
+  }
+
+  if (obj->IsString()) {
+    tainttracking::OnNewDeserializedString(String::cast(obj));
   }
   // Check alignment.
   DCHECK_EQ(0, Heap::GetFillToAlign(obj->address(), obj->RequiredAlignment()));

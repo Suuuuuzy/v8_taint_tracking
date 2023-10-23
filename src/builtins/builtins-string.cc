@@ -7,6 +7,8 @@
 
 #include "src/code-factory.h"
 
+#include "src/taint_tracking.h"
+
 namespace v8 {
 namespace internal {
 
@@ -54,6 +56,11 @@ void Builtins::Generate_StringFromCharCode(CodeStubAssembler* assembler) {
     Node* length = assembler->LoadAndUntagSmi(
         parent_frame_pointer, ArgumentsAdaptorFrameConstants::kLengthOffset);
 
+    Node* taint_start = assembler->IntPtrAdd(
+            assembler->IntPtrConstant(SeqOneByteString::kHeaderSize -
+                                      kHeapObjectTag),
+            length);
+
     // Assume that the resulting string contains only one-byte characters.
     Node* result = assembler->AllocateSeqOneByteString(context, length);
 
@@ -100,6 +107,11 @@ void Builtins::Generate_StringFromCharCode(CodeStubAssembler* assembler) {
                                           kHeapObjectTag),
                 offset),
             code16);
+        // Init taint with 0's
+        assembler->StoreNoWriteBarrier(
+            MachineRepresentation::kWord8, result,
+            assembler->IntPtrAdd(taint_start, offset),
+            assembler->IntPtrConstant(0));
         var_offset.Bind(
             assembler->IntPtrAdd(offset, assembler->IntPtrConstant(1)));
         assembler->Goto(&loop);
@@ -110,6 +122,11 @@ void Builtins::Generate_StringFromCharCode(CodeStubAssembler* assembler) {
         // Allocate a SeqTwoByteString to hold the resulting string.
         Node* cresult = assembler->AllocateSeqTwoByteString(context, length);
 
+        Node* length_double = assembler->WordShl(length, 1);
+        Node* ctaint_start =assembler->IntPtrAdd(
+                assembler->IntPtrConstant(
+                        SeqTwoByteString::kHeaderSize - kHeapObjectTag),
+                length_double);
         // Copy all characters that were previously written to the
         // SeqOneByteString in {result} over to the new {cresult}.
         Variable var_coffset(assembler, MachineType::PointerRepresentation());
@@ -133,6 +150,13 @@ void Builtins::Generate_StringFromCharCode(CodeStubAssembler* assembler) {
                                             kHeapObjectTag),
                   assembler->WordShl(coffset, 1)),
               ccode);
+          // Init taint with 0's TODO: does this work?
+          assembler->StoreNoWriteBarrier(
+              MachineRepresentation::kWord8, cresult,
+              assembler->IntPtrAdd(
+                  ctaint_start,
+                  coffset),
+              assembler->IntPtrConstant(0));
           var_coffset.Bind(
               assembler->IntPtrAdd(coffset, assembler->IntPtrConstant(1)));
           assembler->Goto(&cloop);
@@ -182,6 +206,13 @@ void Builtins::Generate_StringFromCharCode(CodeStubAssembler* assembler) {
                                             kHeapObjectTag),
                   assembler->WordShl(offset, 1)),
               code16);
+          // Init taint with 0's TODO: does this work?
+          assembler->StoreNoWriteBarrier(
+              MachineRepresentation::kWord8, cresult,
+              assembler->IntPtrAdd(
+                  ctaint_start,
+                  offset),
+              assembler->IntPtrConstant(0));
           var_offset.Bind(offset);
           assembler->Goto(&floop);
         }
@@ -508,6 +539,48 @@ BUILTIN(StringPrototypeTrimRight) {
   HandleScope scope(isolate);
   TO_THIS_STRING(string, "String.prototype.trimRight");
   return *String::Trim(string, String::kTrimRight);
+}
+
+BUILTIN(StringPrototypeSetTaint) {
+  HandleScope scope(isolate);
+  TO_THIS_STRING(string, "String.prototype.__setTaint__");
+  uint32_t taint_value;
+  Handle<Object> taint_arg = args.atOrUndefined(isolate, 1);
+  if (taint_arg->ToUint32(&taint_value)) {
+    tainttracking::SetTaintString(
+        string, static_cast<tainttracking::TaintType>(taint_value));
+    return *(isolate->factory()->undefined_value());
+  } else if (taint_arg->IsJSArrayBuffer()) {
+    JSArrayBuffer* taint_data = JSArrayBuffer::cast(*taint_arg);
+    int len = -1;
+    if (!taint_data->byte_length()->ToInt32(&len)) {
+      THROW_NEW_ERROR_RETURN_FAILURE(
+        isolate, NewTypeError(MessageTemplate::kInvalidArgument, taint_arg));
+    }
+    if (len != string->length()) {
+      THROW_NEW_ERROR_RETURN_FAILURE(
+        isolate, NewTypeError(MessageTemplate::kInvalidArgument, taint_arg));
+    }
+    tainttracking::JSSetTaintBuffer(string, handle(taint_data));
+    return *(isolate->factory()->undefined_value());
+  }
+  THROW_NEW_ERROR_RETURN_FAILURE(
+      isolate, NewTypeError(MessageTemplate::kInvalidArgument, taint_arg));
+}
+
+BUILTIN(StringPrototypeGetTaint) {
+  HandleScope scope(isolate);
+  TO_THIS_STRING(string, "String.prototype.__getTaint__");
+  return *tainttracking::JSGetTaintStatus(string, isolate);
+}
+
+BUILTIN(StringPrototypeCheckTaint) {
+  HandleScope scope(isolate);
+  TO_THIS_STRING(string, "String.prototype.__checkTaint__");
+  return *(tainttracking::JSCheckTaintMaybeLog(
+                   string,
+                   args.atOrUndefined(isolate, 1),
+                   0));
 }
 
 // ES6 section 21.1.3.28 String.prototype.valueOf ( )

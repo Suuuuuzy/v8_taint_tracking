@@ -8,6 +8,7 @@
 #include "src/regexp/jsregexp-inl.h"
 #include "src/string-builder.h"
 #include "src/string-search.h"
+#include "src/taint_tracking.h"
 
 namespace v8 {
 namespace internal {
@@ -437,22 +438,27 @@ RUNTIME_FUNCTION(Runtime_StringBuilderConcat) {
   if (length == -1) {
     return isolate->Throw(isolate->heap()->illegal_argument_string());
   }
-
   if (one_byte) {
     Handle<SeqOneByteString> answer;
     ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
         isolate, answer, isolate->factory()->NewRawOneByteString(length));
-    StringBuilderConcatHelper(*special, answer->GetChars(),
-                              FixedArray::cast(array->elements()),
-                              array_length);
+    StringBuilderConcatHelper(
+        *special, answer->GetChars(),
+        FixedArray::cast(array->elements()),
+        array_length,
+        tainttracking::GetWriteableStringTaintData(*answer));
+    tainttracking::OnJoinManyStrings(*answer, *array);
     return *answer;
   } else {
     Handle<SeqTwoByteString> answer;
     ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
         isolate, answer, isolate->factory()->NewRawTwoByteString(length));
-    StringBuilderConcatHelper(*special, answer->GetChars(),
-                              FixedArray::cast(array->elements()),
-                              array_length);
+    StringBuilderConcatHelper(
+        *special, answer->GetChars(),
+        FixedArray::cast(array->elements()),
+        array_length,
+        tainttracking::GetWriteableStringTaintData(*answer));
+    tainttracking::OnJoinManyStrings(*answer, *array);
     return *answer;
   }
 }
@@ -511,6 +517,9 @@ RUNTIME_FUNCTION(Runtime_StringBuilderJoin) {
   DisallowHeapAllocation no_gc;
 
   uc16* sink = answer->GetChars();
+  tainttracking::TaintData* taint_sink =
+    tainttracking::GetWriteableStringTaintData(*answer);
+  // TODO: log symbolic
 #ifdef DEBUG
   uc16* end = sink + length;
 #endif
@@ -521,69 +530,89 @@ RUNTIME_FUNCTION(Runtime_StringBuilderJoin) {
 
   int first_length = first->length();
   String::WriteToFlat(first, sink, 0, first_length);
+  tainttracking::FlattenTaintData(first, taint_sink, 0, first_length);
   sink += first_length;
+  taint_sink += first_length;
 
   for (int i = 1; i < array_length; i++) {
     DCHECK(sink + separator_length <= end);
     String::WriteToFlat(separator_raw, sink, 0, separator_length);
+    tainttracking::FlattenTaintData(
+        separator_raw, taint_sink, 0, separator_length);
     sink += separator_length;
+    taint_sink += separator_length;
 
     CHECK(fixed_array->get(i)->IsString());
     String* element = String::cast(fixed_array->get(i));
     int element_length = element->length();
     DCHECK(sink + element_length <= end);
     String::WriteToFlat(element, sink, 0, element_length);
+    tainttracking::FlattenTaintData(element, taint_sink, 0, element_length);
     sink += element_length;
+    taint_sink += element_length;
   }
   DCHECK(sink == end);
 
   // Use %_FastOneByteArrayJoin instead.
   DCHECK(!answer->IsOneByteRepresentation());
+  tainttracking::OnJoinManyStrings(*answer, *array);
   return *answer;
 }
 
-template <typename sinkchar>
-static void WriteRepeatToFlat(String* src, Vector<sinkchar> buffer, int cursor,
+template <typename ResultString, typename sinkchar>
+static void WriteRepeatToFlat(String* src, ResultString* buffer, int cursor,
                               int repeat, int length) {
   if (repeat == 0) return;
 
-  sinkchar* start = &buffer[cursor];
+  sinkchar* start = buffer->GetChars() + cursor;
   String::WriteToFlat<sinkchar>(src, start, 0, length);
+
+  tainttracking::TaintData* start_taint =
+    tainttracking::GetWriteableStringTaintData(buffer) + cursor;
+  tainttracking::FlattenTaintData(src, start_taint, 0, length);
 
   int done = 1;
   sinkchar* next = start + length;
+  tainttracking::TaintData* next_taint = start_taint + length;
 
   while (done < repeat) {
     int block = Min(done, repeat - done);
     int block_chars = block * length;
     CopyChars(next, start, block_chars);
+    CopyChars(next_taint, start_taint, block_chars);
     next += block_chars;
+    next_taint += block_chars;
     done += block;
   }
 }
 
-template <typename Char>
+template <typename ResultString, typename sinkchar>
 static void JoinSparseArrayWithSeparator(FixedArray* elements,
                                          int elements_length,
                                          uint32_t array_length,
                                          String* separator,
-                                         Vector<Char> buffer) {
+                                         Handle<ResultString> buffer) {
   DisallowHeapAllocation no_gc;
   int previous_separator_position = 0;
   int separator_length = separator->length();
   DCHECK_LT(0, separator_length);
   int cursor = 0;
+  tainttracking::TaintData* buffer_taint =
+    tainttracking::GetWriteableStringTaintData(*buffer);
   for (int i = 0; i < elements_length; i += 2) {
     int position = NumberToInt32(elements->get(i));
     String* string = String::cast(elements->get(i + 1));
     int string_length = string->length();
     if (string->length() > 0) {
       int repeat = position - previous_separator_position;
-      WriteRepeatToFlat<Char>(separator, buffer, cursor, repeat,
-                              separator_length);
+      WriteRepeatToFlat<ResultString, sinkchar>(
+          separator, *buffer, cursor, repeat, separator_length);
       cursor += repeat * separator_length;
       previous_separator_position = position;
-      String::WriteToFlat<Char>(string, &buffer[cursor], 0, string_length);
+      String::WriteToFlat<sinkchar>(
+          string, buffer->GetChars() + cursor, 0, string_length);
+      tainttracking::FlattenTaintData(
+          string, buffer_taint + cursor, 0, string_length);
       cursor += string->length();
     }
   }
@@ -593,9 +622,10 @@ static void JoinSparseArrayWithSeparator(FixedArray* elements,
   // otherwise the total string length would have been too large.
   DCHECK(array_length <= 0x7fffffff);  // Is int32_t.
   int repeat = last_array_index - previous_separator_position;
-  WriteRepeatToFlat<Char>(separator, buffer, cursor, repeat, separator_length);
+  WriteRepeatToFlat<ResultString, sinkchar>(
+      separator, *buffer, cursor, repeat, separator_length);
   cursor += repeat * separator_length;
-  DCHECK(cursor <= buffer.length());
+  DCHECK(cursor <= buffer->length());
 }
 
 
@@ -666,19 +696,27 @@ RUNTIME_FUNCTION(Runtime_SparseJoinWithSeparator) {
     Handle<SeqOneByteString> result = isolate->factory()
                                           ->NewRawOneByteString(string_length)
                                           .ToHandleChecked();
-    JoinSparseArrayWithSeparator<uint8_t>(
+    JoinSparseArrayWithSeparator<SeqOneByteString, uint8_t>(
         FixedArray::cast(elements_array->elements()), elements_length,
         array_length, *separator,
-        Vector<uint8_t>(result->GetChars(), string_length));
+        result);
+    {
+      DisallowHeapAllocation no_gc;
+      tainttracking::OnJoinManyStrings(*result, *elements_array);
+    }
     return *result;
   } else {
     Handle<SeqTwoByteString> result = isolate->factory()
                                           ->NewRawTwoByteString(string_length)
                                           .ToHandleChecked();
-    JoinSparseArrayWithSeparator<uc16>(
+    JoinSparseArrayWithSeparator<SeqTwoByteString, uc16>(
         FixedArray::cast(elements_array->elements()), elements_length,
         array_length, *separator,
-        Vector<uc16>(result->GetChars(), string_length));
+        result);
+    {
+      DisallowHeapAllocation no_gc;
+      tainttracking::OnJoinManyStrings(*result, *elements_array);
+    }
     return *result;
   }
 }
@@ -748,9 +786,8 @@ RUNTIME_FUNCTION(Runtime_StringToArray) {
     elements = isolate->factory()->NewFixedArray(length);
   }
   for (int i = position; i < length; ++i) {
-    Handle<Object> str =
-        isolate->factory()->LookupSingleCharacterStringFromCode(s->Get(i));
-    elements->set(i, *str);
+    // Use the substring command so that the taint gets propogated
+    elements->set(i, *(isolate->factory()->NewSubString(s, i, i + 1)));
   }
 
 #ifdef DEBUG
@@ -859,6 +896,7 @@ MUST_USE_RESULT static Object* ConvertCaseHelper(
     current = next;
   }
   if (has_changed_character) {
+    tainttracking::OnConvertCase(string, result);
     return result;
   } else {
     // If we didn't actually change anything in doing the conversion
@@ -1012,6 +1050,7 @@ MUST_USE_RESULT static Object* ConvertCase(
         reinterpret_cast<char*>(result->GetChars()),
         reinterpret_cast<const char*>(flat_content.ToOneByteVector().start()),
         length, &has_changed_character);
+    tainttracking::OnConvertCase(*s, *result);
     // If not ASCII, we discard the result and take the 2 byte path.
     if (is_ascii) return has_changed_character ? *result : *s;
   }

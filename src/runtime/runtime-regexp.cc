@@ -435,32 +435,49 @@ MUST_USE_RESULT static Object* StringReplaceGlobalAtomRegExpWithString(
   ASSIGN_RETURN_FAILURE_ON_EXCEPTION(isolate, untyped_res, maybe_res);
   Handle<ResultSeqString> result = Handle<ResultSeqString>::cast(untyped_res);
 
-  for (int i = 0; i < matches; i++) {
-    // Copy non-matched subject content.
-    if (subject_pos < indices.at(i)) {
-      String::WriteToFlat(*subject, result->GetChars() + result_pos,
-                          subject_pos, indices.at(i));
-      result_pos += indices.at(i) - subject_pos;
-    }
+  {
+    DisallowHeapAllocation no_gc;
+    // TODO: log symbolic
+    tainttracking::TaintData* data =
+      tainttracking::GetWriteableStringTaintData(*result);
+    for (int i = 0; i < matches; i++) {
+      // Copy non-matched subject content.
+      if (subject_pos < indices.at(i)) {
+        String::WriteToFlat(
+            *subject, result->GetChars() + result_pos,
+            subject_pos, indices.at(i));
+        tainttracking::FlattenTaintData(
+            *subject, data + result_pos, subject_pos,
+            indices.at(i) - subject_pos);
+          result_pos += indices.at(i) - subject_pos;
+      }
 
-    // Replace match.
-    if (replacement_len > 0) {
-      String::WriteToFlat(*replacement, result->GetChars() + result_pos, 0,
-                          replacement_len);
-      result_pos += replacement_len;
-    }
+      // Replace match.
+      if (replacement_len > 0) {
+        String::WriteToFlat(
+            *replacement, result->GetChars() + result_pos, 0, replacement_len);
+        tainttracking::FlattenTaintData(
+            *replacement, data + result_pos, 0, replacement_len);
+        result_pos += replacement_len;
+      }
 
-    subject_pos = indices.at(i) + pattern_len;
-  }
-  // Add remaining subject content at the end.
-  if (subject_pos < subject_len) {
-    String::WriteToFlat(*subject, result->GetChars() + result_pos, subject_pos,
-                        subject_len);
+      subject_pos = indices.at(i) + pattern_len;
+    }
+    // Add remaining subject content at the end.
+    if (subject_pos < subject_len) {
+      String::WriteToFlat(
+          *subject, result->GetChars() + result_pos, subject_pos, subject_len);
+      tainttracking::FlattenTaintData(
+          *subject, data + result_pos, subject_pos, subject_len - subject_pos);
+    }
   }
 
   int32_t match_indices[] = {indices.at(matches - 1),
                              indices.at(matches - 1) + pattern_len};
   RegExpImpl::SetLastMatchInfo(last_match_info, subject, 0, match_indices);
+
+  tainttracking::OnNewReplaceRegexpWithString(
+      *subject, *result, *pattern_regexp, *replacement);
 
   return *result;
 }
@@ -554,9 +571,9 @@ MUST_USE_RESULT static Object* StringReplaceGlobalRegExpWithEmptyString(
     Handle<JSArray> last_match_info) {
   DCHECK(subject->IsFlat());
 
+  Handle<String> empty_string = isolate->factory()->empty_string();
   // Shortcut for simple non-regexp global replacements
   if (regexp->TypeTag() == JSRegExp::ATOM) {
-    Handle<String> empty_string = isolate->factory()->empty_string();
     if (subject->IsOneByteRepresentation()) {
       return StringReplaceGlobalAtomRegExpWithString<SeqOneByteString>(
           isolate, subject, regexp, empty_string, last_match_info);
@@ -595,13 +612,18 @@ MUST_USE_RESULT static Object* StringReplaceGlobalRegExpWithEmptyString(
   int prev = 0;
   int position = 0;
 
+  tainttracking::TaintData taint_data[new_length];
+
   do {
     start = current_match[0];
     end = current_match[1];
     if (prev < start) {
       // Add substring subject[prev;start] to answer string.
       String::WriteToFlat(*subject, answer->GetChars() + position, prev, start);
-      position += start - prev;
+      int len = start - prev;
+      tainttracking::FlattenTaintData(
+          *subject, &taint_data[position], prev, len);
+      position += len;
     }
     prev = end;
 
@@ -615,9 +637,12 @@ MUST_USE_RESULT static Object* StringReplaceGlobalRegExpWithEmptyString(
 
   if (prev < subject_length) {
     // Add substring subject[prev;length] to answer string.
+    int len = subject_length - prev;
     String::WriteToFlat(*subject, answer->GetChars() + position, prev,
                         subject_length);
-    position += subject_length - prev;
+    tainttracking::FlattenTaintData(
+        *subject, &taint_data[position], prev, len);
+    position += len;
   }
 
   if (position == 0) return isolate->heap()->empty_string();
@@ -628,6 +653,9 @@ MUST_USE_RESULT static Object* StringReplaceGlobalRegExpWithEmptyString(
   int delta = allocated_string_size - string_size;
 
   answer->set_length(position);
+  tainttracking::CopyIn(
+      *Handle<ResultSeqString>::cast(answer), taint_data, 0, position);
+
   if (delta == 0) return *answer;
 
   Address end_of_string = answer->address() + string_size;
@@ -643,6 +671,9 @@ MUST_USE_RESULT static Object* StringReplaceGlobalRegExpWithEmptyString(
     heap->CreateFillerObjectAt(end_of_string, delta, ClearRecordedSlots::kNo);
   }
   heap->AdjustLiveBytes(*answer, -delta, Heap::CONCURRENT_TO_SWEEPER);
+
+  tainttracking::OnNewReplaceRegexpWithString(
+      *subject, *answer, *regexp, *empty_string);
   return *answer;
 }
 

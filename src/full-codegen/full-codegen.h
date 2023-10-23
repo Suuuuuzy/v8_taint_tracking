@@ -17,6 +17,7 @@
 #include "src/deoptimizer.h"
 #include "src/globals.h"
 #include "src/objects.h"
+#include "src/taint_tracking.h"
 
 namespace v8 {
 namespace internal {
@@ -48,7 +49,8 @@ class FullCodeGenerator final : public AstVisitor<FullCodeGenerator> {
         handler_table_(info->zone()),
         source_position_table_builder_(info->isolate(), info->zone(),
                                        info->SourcePositionRecordingMode()),
-        ic_total_count_(0) {
+        ic_total_count_(0),
+        node_label_serializer_(isolate_) {
     DCHECK(!info->IsStub());
     Initialize();
   }
@@ -369,6 +371,8 @@ class FullCodeGenerator final : public AstVisitor<FullCodeGenerator> {
   }
 
   void VisitInDuplicateContext(Expression* expr);
+  void VisitInDuplicateContextAndHookTaint(
+      Expression* eval, Expression* hookval);
 
   void VisitDeclarations(ZoneList<Declaration*>* declarations);
   void DeclareGlobals(Handle<FixedArray> pairs);
@@ -416,7 +420,8 @@ class FullCodeGenerator final : public AstVisitor<FullCodeGenerator> {
   // a given literal string.
   void EmitLiteralCompareTypeof(Expression* expr,
                                 Expression* sub_expr,
-                                Handle<String> check);
+                                Handle<String> check,
+                                Expression* typeofexpr_taint = nullptr);
 
   // Platform-specific code for equality comparison with a nil-like value.
   void EmitLiteralCompareNil(CompareOperation* expr,
@@ -544,7 +549,9 @@ class FullCodeGenerator final : public AstVisitor<FullCodeGenerator> {
 
   // Platform-specific support for allocating a new closure based on
   // the given function info.
-  void EmitNewClosure(Handle<SharedFunctionInfo> info, bool pretenure);
+  void EmitNewClosure(Expression* expr,
+                      Handle<SharedFunctionInfo> info,
+                      bool pretenure);
 
   // Re-usable portions of CallRuntime
   void EmitLoadJSRuntimeFunction(CallRuntime* expr);
@@ -576,7 +583,15 @@ class FullCodeGenerator final : public AstVisitor<FullCodeGenerator> {
 
   // Apply the compound assignment operator. Expects the left operand on top
   // of the stack and the right one in the accumulator.
-  void EmitBinaryOp(BinaryOperation* expr, Token::Value op);
+  void EmitBinaryOp(BinaryOperation* expr,
+                    Token::Value op,
+
+                    // If the state == ADD_HOOK, then emit the code for the
+                    // taint tracking hook as well.
+                    tainttracking::ValueState state =
+                      tainttracking::ValueState::NONE);
+
+  void BuildUnaryOperation(UnaryOperation* expr);
 
   // Helper functions for generating inlined smi code for certain
   // binary operations.
@@ -592,12 +607,15 @@ class FullCodeGenerator final : public AstVisitor<FullCodeGenerator> {
 
   // Complete a variable assignment.  The right-hand-side value is expected
   // in the accumulator.
-  void EmitVariableAssignment(Variable* var, Token::Value op,
-                              FeedbackVectorSlot slot);
+  void EmitVariableAssignment(Variable* var,
+                              Token::Value op,
+                              FeedbackVectorSlot slot,
+                              Expression* rhs = nullptr);
 
   // Helper functions to EmitVariableAssignment
   void EmitStoreToStackLocalOrContextSlot(Variable* var,
-                                          MemOperand location);
+                                          MemOperand location,
+                                          Expression* rhs);
 
   // Complete a named property assignment.  The receiver is expected on top
   // of the stack and the right-hand-side value in the accumulator.
@@ -665,13 +683,14 @@ class FullCodeGenerator final : public AstVisitor<FullCodeGenerator> {
     SetCallPosition(expr);
   }
 
-  void RecordStatementPosition(int pos);
-  void RecordPosition(int pos);
+  void RecordStatementPosition(int pos, int ast_taint_tracking_index);
+  void RecordPosition(int pos, int ast_taint_tracking_index);
 
   // Non-local control flow support.
   void EnterTryBlock(int handler_index, Label* handler,
-                     HandlerTable::CatchPrediction catch_prediction);
-  void ExitTryBlock(int handler_index);
+                     HandlerTable::CatchPrediction catch_prediction,
+                     Statement* stmt);
+  void ExitTryBlock(int handler_index, Statement* stmt);
   void EnterFinallyBlock();
   void ExitFinallyBlock();
   void ClearPendingMessage();
@@ -740,6 +759,88 @@ class FullCodeGenerator final : public AstVisitor<FullCodeGenerator> {
   bool MustCreateArrayLiteralWithRuntime(ArrayLiteral* expr) const;
 
   int NewHandlerTableEntry();
+
+
+  // Helpers for taint tracking
+  void GenerateCompareOperation(CompareOperation* expr);
+  tainttracking::Status GenerateTaintTrackingPrepare(
+      AstNode* expr, Handle<Object>* label);
+  void GenerateTaintTrackingBody(
+      Handle<Object> label,
+      tainttracking::CheckType check);
+
+  // Before storing in a variable/memory location
+  // concrete: value to be stored
+  // expr_label: NodeLabel of the Assignment expression doing assigning
+  void GenerateTaintTrackingHookMemoryStorage(
+      Register concrete,
+      Handle<Object> expr_label,
+      tainttracking::CheckType checktype,
+      int parameter_var_idx = tainttracking::NO_VARIABLE_INDEX);
+  void GenerateTaintTrackingHookMemoryStorage(
+      Register concrete,
+      Expression* expr,
+      tainttracking::CheckType checktype);
+  void GenerateTaintTrackingHookMemoryStorage(
+      Register concrete,
+      Expression* expr,
+      tainttracking::CheckType checktype,
+      Register property_holder);
+
+  void GenerateTaintTrackingHookMemoryContextStorage(
+      Register concrete,
+      Handle<Object> label,
+      Register context,
+      int index);
+
+  void GenerateTaintTrackingHookParameterToContextStorage(
+      int parameter_index,
+      int context_slot_index,
+      Register context);
+
+  void GenerateTaintTrackingHookSetReturn(
+      Register reg, AstNode* expr = nullptr);
+
+  void GenerateTaintTrackingHookEnterTry(AstNode* expr);
+  void GenerateTaintTrackingHookExitTry(AstNode* expr);
+  void GenerateTaintTrackingHookExitFinally();
+
+  void GenerateTaintTrackingEnterFrame(Call* caller = nullptr);
+  void GenerateTaintTrackingPrepareFrame(tainttracking::FrameType frame_type);
+  void GenerateTaintTrackingExitFrame();
+  void GenerateTaintTrackingAddArgument(Expression* expr, Call* caller = nullptr);
+
+  void GenerateTaintTrackingHookReceiverTOS(
+      Expression* symbolic);
+  void GenerateTaintTrackingHookReceiver(
+      Register literal, Expression* symbolic);
+  void GenerateTaintTrackingHookReceiverBody(
+      Handle<Object> label_value);
+
+
+  void GenerateTaintTrackingHookLValue(Expression* lvalue);
+
+  int GenerateTaintStackSlotMultiplier();
+
+  // Generate a taint tracking hook for the value returned by expression
+  void GenerateTaintTrackingHook(Register reg, Expression* expr);
+  void GenerateTaintTrackingHook(Handle<Object> value, Expression* expr);
+  void GenerateTaintTrackingHook(
+      tainttracking::ValueState value, AstNode* expr);
+  void GenerateTaintTrackingHookBefore(
+      Register reg, Expression* expr);
+  void GenerateTaintTrackingHookImmediate(bool value, Expression* expr);
+  void GenerateTaintTrackingHookVariable(Variable* var, Expression* expr);
+
+  // Value is on the top of the stack.
+  void GenerateTaintTrackingHookTOS(Expression* expr);
+
+  // Storing taint tracking variables
+  MemOperand SymbolicStateForVar(Variable* var, Register scratch);
+  void GenerateTaintTrackingHookVariableLoad(Register reg, VariableProxy* expr);
+
+  void GenerateTaintTrackingMessageOriginCheck(Token::Value op);
+
 
   struct BailoutEntry {
     BailoutId id;
@@ -835,7 +936,8 @@ class FullCodeGenerator final : public AstVisitor<FullCodeGenerator> {
 
     void Plug(bool flag) const override;
     void Plug(Register reg) const override;
-    void Plug(Label* materialize_true, Label* materialize_false) const override;
+    void Plug(Label* materialize_true,
+              Label* materialize_false) const override;
     void Plug(Variable* var) const override;
     void Plug(Handle<Object> lit) const override;
     void Plug(Heap::RootListIndex) const override;
@@ -854,7 +956,8 @@ class FullCodeGenerator final : public AstVisitor<FullCodeGenerator> {
 
     void Plug(bool flag) const override;
     void Plug(Register reg) const override;
-    void Plug(Label* materialize_true, Label* materialize_false) const override;
+    void Plug(Label* materialize_true,
+              Label* materialize_false) const override;
     void Plug(Variable* var) const override;
     void Plug(Handle<Object> lit) const override;
     void Plug(Heap::RootListIndex) const override;
@@ -891,7 +994,8 @@ class FullCodeGenerator final : public AstVisitor<FullCodeGenerator> {
 
     void Plug(bool flag) const override;
     void Plug(Register reg) const override;
-    void Plug(Label* materialize_true, Label* materialize_false) const override;
+    void Plug(Label* materialize_true,
+              Label* materialize_false) const override;
     void Plug(Variable* var) const override;
     void Plug(Handle<Object> lit) const override;
     void Plug(Heap::RootListIndex) const override;
@@ -916,7 +1020,8 @@ class FullCodeGenerator final : public AstVisitor<FullCodeGenerator> {
 
     void Plug(bool flag) const override;
     void Plug(Register reg) const override;
-    void Plug(Label* materialize_true, Label* materialize_false) const override;
+    void Plug(Label* materialize_true,
+              Label* materialize_false) const override;
     void Plug(Variable* var) const override;
     void Plug(Handle<Object> lit) const override;
     void Plug(Heap::RootListIndex) const override;
@@ -961,6 +1066,8 @@ class FullCodeGenerator final : public AstVisitor<FullCodeGenerator> {
   SourcePositionTableBuilder source_position_table_builder_;
   int ic_total_count_;
   Handle<Cell> profiling_counter_;
+
+  tainttracking::V8NodeLabelSerializer node_label_serializer_;
 
   friend class NestedStatement;
 

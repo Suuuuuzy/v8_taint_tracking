@@ -87,8 +87,16 @@ class CodeStubGraphBuilderBase : public HGraphBuilder {
   HValue* EmitKeyedSloppyArguments(HValue* receiver, HValue* key,
                                    HValue* value);
 
-  HValue* BuildToString(HValue* input, bool convert);
-  HValue* BuildToPrimitive(HValue* input, HValue* input_map);
+  HValue* BuildToString(
+      HValue* input,
+      bool convert,
+      tainttracking::FrameType taint_tracking_hook =
+        tainttracking::FrameType::UNKNOWN_CAPI);
+  HValue* BuildToPrimitive(
+      HValue* input,
+      HValue* input_map,
+      tainttracking::FrameType taint_tracking_hook =
+        tainttracking::FrameType::UNKNOWN_CAPI);
 
  private:
   std::unique_ptr<HParameter* []> parameters_;
@@ -1356,7 +1364,8 @@ Handle<Code> BinaryOpWithAllocationSiteStub::GenerateCode() {
 }
 
 
-HValue* CodeStubGraphBuilderBase::BuildToString(HValue* input, bool convert) {
+HValue* CodeStubGraphBuilderBase::BuildToString(
+    HValue* input, bool convert, tainttracking::FrameType taint_tracking_hook) {
   if (!convert) return BuildCheckString(input);
   IfBuilder if_inputissmi(this);
   HValue* inputissmi = if_inputissmi.If<HIsSmiAndBranch>(input);
@@ -1395,7 +1404,7 @@ HValue* CodeStubGraphBuilderBase::BuildToString(HValue* input, bool convert) {
       if_inputisprimitive.Else();
       {
         // Convert the input to a primitive.
-        Push(BuildToPrimitive(input, input_map));
+        Push(BuildToPrimitive(input, input_map, taint_tracking_hook));
       }
       if_inputisprimitive.End();
       // Convert the primitive to a string value.
@@ -1412,8 +1421,10 @@ HValue* CodeStubGraphBuilderBase::BuildToString(HValue* input, bool convert) {
 }
 
 
-HValue* CodeStubGraphBuilderBase::BuildToPrimitive(HValue* input,
-                                                   HValue* input_map) {
+HValue* CodeStubGraphBuilderBase::BuildToPrimitive(
+    HValue* input,
+    HValue* input_map,
+    tainttracking::FrameType taint_tracking_hook) {
   // Get the native context of the caller.
   HValue* native_context = BuildGetNativeContext();
 
@@ -1481,8 +1492,16 @@ HValue* CodeStubGraphBuilderBase::BuildToPrimitive(HValue* input,
   {
     // TODO(bmeurer): Add support for fast ToPrimitive conversion using
     // a dedicated ToPrimitiveStub.
+
+    int nargs = 1;
     Add<HPushArguments>(input);
-    Push(Add<HCallRuntime>(Runtime::FunctionForId(Runtime::kToPrimitive), 1));
+    if (taint_tracking_hook != tainttracking::FrameType::UNKNOWN_CAPI) {
+      Add<HPushArguments>(
+          Add<HConstant>(static_cast<int>(taint_tracking_hook)));
+      nargs += 1;
+    }
+    Push(Add<HCallRuntime>(
+             Runtime::FunctionForId(Runtime::kToPrimitive), nargs));
   }
   if_inputisstringwrapper.End();
   return Pop();
@@ -1500,12 +1519,16 @@ HValue* CodeStubGraphBuilder<StringAddStub>::BuildCodeInitializedStub() {
 
   // Make sure that both arguments are strings if not known in advance.
   if ((flags & STRING_ADD_CHECK_LEFT) == STRING_ADD_CHECK_LEFT) {
-    left =
-        BuildToString(left, (flags & STRING_ADD_CONVERT) == STRING_ADD_CONVERT);
+    left = BuildToString(
+        left,
+        (flags & STRING_ADD_CONVERT) == STRING_ADD_CONVERT,
+        tainttracking::FrameType::TO_STRING_CONVERT_PLUS_LEFT);
   }
   if ((flags & STRING_ADD_CHECK_RIGHT) == STRING_ADD_CHECK_RIGHT) {
-    right = BuildToString(right,
-                          (flags & STRING_ADD_CONVERT) == STRING_ADD_CONVERT);
+    right = BuildToString(
+        right,
+        (flags & STRING_ADD_CONVERT) == STRING_ADD_CONVERT,
+        tainttracking::FrameType::TO_STRING_CONVERT_PLUS_RIGHT);
   }
 
   return BuildStringAdd(left, right, HAllocationMode(pretenure_flag));

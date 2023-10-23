@@ -15,6 +15,7 @@
 #include "src/regexp/jsregexp.h"
 #include "src/regexp/regexp-macro-assembler.h"
 #include "src/runtime/runtime.h"
+#include "src/taint_tracking.h"
 #include "src/x64/code-stubs-x64.h"
 
 namespace v8 {
@@ -2041,6 +2042,7 @@ void SubStringStub::Generate(MacroAssembler* masm) {
 
   // Make sure first argument is a string.
   __ movp(rax, args.GetArgumentOperand(STRING_ARGUMENT_INDEX));
+
   STATIC_ASSERT(kSmiTag == 0);
   __ testl(rax, Immediate(kSmiTagMask));
   __ j(zero, &runtime);
@@ -2124,7 +2126,8 @@ void SubStringStub::Generate(MacroAssembler* masm) {
     // is too short to be sliced anyways.
     __ cmpp(rcx, Immediate(SlicedString::kMinLength));
     // Short slice.  Copy instead of slicing.
-    __ j(less, &copy_routine);
+    // Change the jump here to the runtime to handle taints
+    __ j(less, &runtime);
     // Allocate new sliced string.  At this point we do not reload the instance
     // type including the string encoding because we simply rely on the info
     // provided by the original string.  It does not matter if the original
@@ -2158,23 +2161,12 @@ void SubStringStub::Generate(MacroAssembler* masm) {
   // rcx: length
   // The subject string can only be external or sequential string of either
   // encoding at this point.
-  Label two_byte_sequential, sequential_string;
+  Label two_byte_sequential;
   STATIC_ASSERT(kExternalStringTag != 0);
   STATIC_ASSERT(kSeqStringTag == 0);
   __ testb(rbx, Immediate(kExternalStringTag));
-  __ j(zero, &sequential_string);
-
-  // Handle external string.
-  // Rule out short external strings.
-  STATIC_ASSERT(kShortExternalStringTag != 0);
-  __ testb(rbx, Immediate(kShortExternalStringMask));
+  // NotHandling external strings here because they can't handle taints
   __ j(not_zero, &runtime);
-  __ movp(rdi, FieldOperand(rdi, ExternalString::kResourceDataOffset));
-  // Move the pointer so that offset-wise, it looks like a sequential string.
-  STATIC_ASSERT(SeqTwoByteString::kHeaderSize == SeqOneByteString::kHeaderSize);
-  __ subp(rdi, Immediate(SeqTwoByteString::kHeaderSize - kHeapObjectTag));
-
-  __ bind(&sequential_string);
   STATIC_ASSERT((kOneByteStringTag & kStringEncodingMask) != 0);
   __ testb(rbx, Immediate(kStringEncodingMask));
   __ j(zero, &two_byte_sequential);
@@ -2188,7 +2180,20 @@ void SubStringStub::Generate(MacroAssembler* masm) {
     SmiIndex smi_as_index = masm->SmiToIndex(rdx, rdx, times_1);
     __ leap(r14, Operand(rdi, smi_as_index.reg, smi_as_index.scale,
                         SeqOneByteString::kHeaderSize - kHeapObjectTag));
+
+    // r11: beginning of the taint of the result string.
+    // r11 = rdi->length
+    __ movp(r11, FieldOperand(rdi, SeqOneByteString::kLengthOffset));
+    // r11 = rdi + r11 * 1 + header - object
+    __ leap(r11, Operand(
+                     rdi,
+                     r11,
+                     times_1,
+                     SeqOneByteString::kHeaderSize - kHeapObjectTag));
+    __ leap(r11, Operand(
+                     r11, smi_as_index.reg, smi_as_index.scale, 0));
   }
+
   // Locate first character of result.
   __ leap(rdi, FieldOperand(rax, SeqOneByteString::kHeaderSize));
 
@@ -2198,6 +2203,14 @@ void SubStringStub::Generate(MacroAssembler* masm) {
   // rsi: character of sub string start
   StringHelper::GenerateCopyCharacters(
       masm, rdi, r14, rcx, String::ONE_BYTE_ENCODING);
+
+
+  // Copy the taint
+  __ addp(rdi, rcx);
+  StringHelper::GenerateCopyCharacters(
+      masm, rdi, r11, rcx, String::ONE_BYTE_ENCODING);
+
+
   __ IncrementCounter(counters->sub_string_native(), 1);
   __ ret(SUB_STRING_ARGUMENT_COUNT * kPointerSize);
 

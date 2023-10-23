@@ -2010,7 +2010,8 @@ TEST(UseCountRegExp) {
 }
 
 class UncachedExternalString
-    : public v8::String::ExternalOneByteStringResource {
+    : public v8::String::ExternalOneByteStringResource,
+      public v8::String::TaintTrackingStringBufferImpl {
  public:
   const char* data() const override { return "abcdefghijklmnopqrstuvwxyz"; }
   size_t length() const override { return 26; }

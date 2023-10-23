@@ -964,6 +964,9 @@ ExternalReference ExternalReference::interpreter_dispatch_counters(
 ExternalReference::ExternalReference(StatsCounter* counter)
   : address_(reinterpret_cast<Address>(counter->GetInternalPointer())) {}
 
+ExternalReference::ExternalReference(tainttracking::InstanceCounter* counter)
+  : address_(reinterpret_cast<Address>(counter)) {}
+
 
 ExternalReference::ExternalReference(Isolate::AddressId id, Isolate* isolate)
   : address_(isolate->get_address_from_id(id)) {}

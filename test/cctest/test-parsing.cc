@@ -203,7 +203,8 @@ TEST(ScanHTMLEndComments) {
 }
 
 
-class ScriptResource : public v8::String::ExternalOneByteStringResource {
+class ScriptResource : public v8::String::ExternalOneByteStringResource,
+                         public v8::String::TaintTrackingStringBufferImpl {
  public:
   ScriptResource(const char* data, size_t length)
       : data_(data), length_(length) { }
@@ -554,7 +555,9 @@ TEST(PreParseOverflow) {
 }
 
 
-class TestExternalResource: public v8::String::ExternalStringResource {
+class TestExternalResource:
+    public v8::String::ExternalStringResource,
+    public v8::String::TaintTrackingStringBufferImpl {
  public:
   explicit TestExternalResource(uint16_t* data, int length)
       : data_(data), length_(static_cast<size_t>(length)) { }

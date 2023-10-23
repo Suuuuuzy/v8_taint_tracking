@@ -73,7 +73,16 @@ v8_executable("cctest") {
   }
 
   cflags = []
-  ldflags = []
+
+  # Used to link with the capnp library for taint tracking code
+  libs = [ "capnp", "kj" ]
+  if (!(v8_capnp_include_dir == "")) {
+    lib_dirs = [ "$v8_capnp_include_dir/lib" ]
+    include_dirs = [ "$v8_capnp_include_dir/include",
+                     rebase_path("$target_gen_dir/", root_build_dir) ]
+  } else {
+    include_dirs = [ rebase_path("$target_gen_dir/", root_build_dir) ]
+  }
 
   if (v8_current_cpu == "ppc" || v8_current_cpu == "ppc64" ||
       v8_current_cpu == "arm" || v8_current_cpu == "arm64" ||

@@ -11,6 +11,7 @@
 #include "src/conversions.h"
 #include "src/isolate-inl.h"
 #include "src/macro-assembler.h"
+#include "src/taint_tracking.h"
 
 namespace v8 {
 namespace internal {
@@ -240,7 +241,9 @@ Handle<String> Factory::InternalizeStringWithKey(StringTableKey* key) {
 MaybeHandle<String> Factory::NewStringFromOneByte(Vector<const uint8_t> string,
                                                   PretenureFlag pretenure) {
   int length = string.length();
-  if (length == 1) return LookupSingleCharacterStringFromCode(string[0]);
+  if (length == 1 && tainttracking::kInternalizedStringsEnabled) {
+    return LookupSingleCharacterStringFromCode(string[0]);
+  }
   Handle<SeqOneByteString> result;
   ASSIGN_RETURN_ON_EXCEPTION(
       isolate(),
@@ -253,6 +256,7 @@ MaybeHandle<String> Factory::NewStringFromOneByte(Vector<const uint8_t> string,
   CopyChars(SeqOneByteString::cast(*result)->GetChars(),
             string.start(),
             length);
+  tainttracking::OnNewStringLiteral(*result);
   return result;
 }
 
@@ -289,6 +293,7 @@ MaybeHandle<String> Factory::NewStringFromUtf8(Vector<const char> string,
   }
   // Now write the remainder.
   decoder->WriteUtf16(data, utf16_length);
+  tainttracking::OnNewStringLiteral(*result);
   return result;
 }
 
@@ -296,7 +301,9 @@ MaybeHandle<String> Factory::NewStringFromTwoByte(const uc16* string,
                                                   int length,
                                                   PretenureFlag pretenure) {
   if (String::IsOneByte(string, length)) {
-    if (length == 1) return LookupSingleCharacterStringFromCode(string[0]);
+    if (length == 1 && tainttracking::kInternalizedStringsEnabled) {
+      return LookupSingleCharacterStringFromCode(string[0]);
+    }
     Handle<SeqOneByteString> result;
     ASSIGN_RETURN_ON_EXCEPTION(
         isolate(),
@@ -304,6 +311,7 @@ MaybeHandle<String> Factory::NewStringFromTwoByte(const uc16* string,
         NewRawOneByteString(length, pretenure),
         String);
     CopyChars(result->GetChars(), string, length);
+    tainttracking::OnNewStringLiteral(*result);
     return result;
   } else {
     Handle<SeqTwoByteString> result;
@@ -313,6 +321,7 @@ MaybeHandle<String> Factory::NewStringFromTwoByte(const uc16* string,
         NewRawTwoByteString(length, pretenure),
         String);
     CopyChars(result->GetChars(), string, length);
+    tainttracking::OnNewStringLiteral(*result);
     return result;
   }
 }
@@ -328,9 +337,11 @@ MaybeHandle<String> Factory::NewStringFromTwoByte(
                               pretenure);
 }
 
-Handle<String> Factory::NewInternalizedStringFromUtf8(Vector<const char> str,
-                                                      int chars,
-                                                      uint32_t hash_field) {
+
+Handle<String> Factory::NewInternalizedStringFromUtf8Helper(
+    Vector<const char> str,
+    int chars,
+    uint32_t hash_field) {
   CALL_HEAP_FUNCTION(
       isolate(),
       isolate()->heap()->AllocateInternalizedStringFromUtf8(
@@ -339,7 +350,20 @@ Handle<String> Factory::NewInternalizedStringFromUtf8(Vector<const char> str,
 }
 
 
-MUST_USE_RESULT Handle<String> Factory::NewOneByteInternalizedString(
+Handle<String> Factory::NewInternalizedStringFromUtf8(Vector<const char> str,
+                                                      int chars,
+                                                      uint32_t hash_field) {
+  Handle<String> answer =
+    NewInternalizedStringFromUtf8Helper(str, chars, hash_field);
+  {
+    DisallowHeapAllocation no_gc;
+    tainttracking::OnNewStringLiteral(*answer);
+  }
+  return answer;
+}
+
+
+MUST_USE_RESULT Handle<String> Factory::NewOneByteInternalizedStringHelper(
       Vector<const uint8_t> str,
       uint32_t hash_field) {
   CALL_HEAP_FUNCTION(
@@ -348,8 +372,18 @@ MUST_USE_RESULT Handle<String> Factory::NewOneByteInternalizedString(
       String);
 }
 
+MUST_USE_RESULT Handle<String> Factory::NewOneByteInternalizedString(
+      Vector<const uint8_t> str,
+      uint32_t hash_field) {
+  Handle<String> answer = NewOneByteInternalizedStringHelper(str, hash_field);
+  {
+    DisallowHeapAllocation no_gc;
+    tainttracking::OnNewStringLiteral(*answer);
+  }
+  return answer;
+}
 
-MUST_USE_RESULT Handle<String> Factory::NewOneByteInternalizedSubString(
+MUST_USE_RESULT Handle<String> Factory::NewOneByteInternalizedSubStringHelper(
     Handle<SeqOneByteString> string, int offset, int length,
     uint32_t hash_field) {
   CALL_HEAP_FUNCTION(
@@ -359,8 +393,22 @@ MUST_USE_RESULT Handle<String> Factory::NewOneByteInternalizedSubString(
       String);
 }
 
+MUST_USE_RESULT Handle<String> Factory::NewOneByteInternalizedSubString(
+    Handle<SeqOneByteString> string, int offset, int length,
+    uint32_t hash_field) {
+  Handle<String> helper = NewOneByteInternalizedSubStringHelper(
+      string, offset, length, hash_field);
+  {
+    DCHECK(helper->IsSeqOneByteString());
+    DisallowHeapAllocation no_gc;
+    tainttracking::OnNewSubStringCopy(
+        *string, SeqOneByteString::cast(*helper), offset, length);
+  }
+  return helper;
+}
 
-MUST_USE_RESULT Handle<String> Factory::NewTwoByteInternalizedString(
+
+MUST_USE_RESULT Handle<String> Factory::NewTwoByteInternalizedStringHelper(
       Vector<const uc16> str,
       uint32_t hash_field) {
   CALL_HEAP_FUNCTION(
@@ -370,13 +418,37 @@ MUST_USE_RESULT Handle<String> Factory::NewTwoByteInternalizedString(
 }
 
 
-Handle<String> Factory::NewInternalizedStringImpl(
+MUST_USE_RESULT Handle<String> Factory::NewTwoByteInternalizedString(
+      Vector<const uc16> str,
+      uint32_t hash_field) {
+  Handle<String> answer = NewTwoByteInternalizedStringHelper(str, hash_field);
+  {
+    DisallowHeapAllocation no_gc;
+    tainttracking::OnNewStringLiteral(*answer);
+  }
+  return answer;
+}
+
+Handle<String> Factory::NewInternalizedStringImplHelper(
     Handle<String> string, int chars, uint32_t hash_field) {
   CALL_HEAP_FUNCTION(
       isolate(),
       isolate()->heap()->AllocateInternalizedStringImpl(
           *string, chars, hash_field),
       String);
+}
+
+Handle<String> Factory::NewInternalizedStringImpl(
+    Handle<String> string, int chars, uint32_t hash_field) {
+  Handle<String> helper = NewInternalizedStringImplHelper(
+      string, chars, hash_field);
+  {
+    DCHECK(helper->IsSeqString());
+    DisallowHeapAllocation no_gc;
+    tainttracking::OnNewSubStringCopy(
+        *string, SeqString::cast(*helper), 0, chars);
+  }
+  return helper;
 }
 
 
@@ -432,6 +504,15 @@ MaybeHandle<SeqTwoByteString> Factory::NewRawTwoByteString(
 
 Handle<String> Factory::LookupSingleCharacterStringFromCode(uint32_t code) {
   if (code <= String::kMaxOneByteCharCodeU) {
+    if (!tainttracking::kInternalizedStringsEnabled) {
+      Handle<SeqOneByteString> result =
+        NewRawOneByteString(1).ToHandleChecked();
+      result->SeqOneByteStringSet(0, static_cast<uint8_t>(code));
+      DisallowHeapAllocation no_gc;
+      tainttracking::OnNewStringLiteral(*result);
+      return result;
+    }
+
     {
       DisallowHeapAllocation no_allocation;
       Object* value = single_character_string_cache()->get(code);
@@ -450,6 +531,10 @@ Handle<String> Factory::LookupSingleCharacterStringFromCode(uint32_t code) {
 
   Handle<SeqTwoByteString> result = NewRawTwoByteString(1).ToHandleChecked();
   result->SeqTwoByteStringSet(0, static_cast<uint16_t>(code));
+  {
+    DisallowHeapAllocation no_gc;
+    tainttracking::OnNewStringLiteral(*result);
+  }
   return result;
 }
 
@@ -466,7 +551,8 @@ static inline Handle<String> MakeOrFindTwoCharacterString(Isolate* isolate,
                                                           uint16_t c2) {
   // Numeric strings have a different hash algorithm not known by
   // LookupTwoCharsStringIfExists, so we skip this step for such strings.
-  if (!Between(c1, '0', '9') || !Between(c2, '0', '9')) {
+  if ((!Between(c1, '0', '9') || !Between(c2, '0', '9')) &&
+      tainttracking::kInternalizedStringsEnabled) {
     Handle<String> result;
     if (StringTable::LookupTwoCharsStringIfExists(isolate, c1, c2).
         ToHandle(&result)) {
@@ -476,7 +562,8 @@ static inline Handle<String> MakeOrFindTwoCharacterString(Isolate* isolate,
 
   // Now we know the length is 2, we might as well make use of that fact
   // when building the new string.
-  if (static_cast<unsigned>(c1 | c2) <= String::kMaxOneByteCharCodeU) {
+  if (static_cast<unsigned>(c1 | c2) <= String::kMaxOneByteCharCodeU &&
+      tainttracking::kInternalizedStringsEnabled) {
     // We can do this.
     DCHECK(base::bits::IsPowerOfTwo32(String::kMaxOneByteCharCodeU +
                                       1));  // because of this.
@@ -485,6 +572,8 @@ static inline Handle<String> MakeOrFindTwoCharacterString(Isolate* isolate,
     uint8_t* dest = str->GetChars();
     dest[0] = static_cast<uint8_t>(c1);
     dest[1] = static_cast<uint8_t>(c2);
+    DisallowHeapAllocation no_gc;
+    tainttracking::OnNewStringLiteral(*str);
     return str;
   } else {
     Handle<SeqTwoByteString> str =
@@ -492,6 +581,8 @@ static inline Handle<String> MakeOrFindTwoCharacterString(Isolate* isolate,
     uc16* dest = str->GetChars();
     dest[0] = c1;
     dest[1] = c2;
+    DisallowHeapAllocation no_gc;
+    tainttracking::OnNewStringLiteral(*str);
     return str;
   }
 }
@@ -505,6 +596,7 @@ Handle<String> ConcatStringContent(Handle<StringType> result,
   SinkChar* sink = result->GetChars();
   String::WriteToFlat(*first, sink, 0, first->length());
   String::WriteToFlat(*second, sink + first->length(), 0, second->length());
+  tainttracking::OnNewConcatStringCopy(*result, *first, *second);
   return result;
 }
 
@@ -518,7 +610,7 @@ MaybeHandle<String> Factory::NewConsString(Handle<String> left,
 
   int length = left_length + right_length;
 
-  if (length == 2) {
+  if (length == 2 && tainttracking::kInternalizedStringsEnabled) {
     uint16_t c1 = left->Get(0);
     uint16_t c2 = right->Get(0);
     return MakeOrFindTwoCharacterString(isolate(), c1, c2);
@@ -569,6 +661,8 @@ MaybeHandle<String> Factory::NewConsString(Handle<String> left,
                 ? Handle<ExternalOneByteString>::cast(right)->GetChars()
                 : Handle<SeqOneByteString>::cast(right)->GetChars();
       for (int i = 0; i < right_length; i++) *dest++ = src[i];
+
+      tainttracking::OnNewConcatStringCopy(*result, *left, *right);
       return result;
     }
 
@@ -583,7 +677,7 @@ MaybeHandle<String> Factory::NewConsString(Handle<String> left,
       (is_one_byte || is_one_byte_data_in_two_byte_string)
           ? New<ConsString>(cons_one_byte_string_map(), NEW_SPACE)
           : New<ConsString>(cons_string_map(), NEW_SPACE);
-
+  // TODO: log symbolic
   DisallowHeapAllocation no_gc;
   WriteBarrierMode mode = result->GetWriteBarrierMode(no_gc);
 
@@ -591,6 +685,7 @@ MaybeHandle<String> Factory::NewConsString(Handle<String> left,
   result->set_length(length);
   result->set_first(*left, mode);
   result->set_second(*right, mode);
+  tainttracking::OnNewConsString(*result, *left, *right);
   return result;
 }
 
@@ -607,10 +702,10 @@ Handle<String> Factory::NewProperSubString(Handle<String> str,
 
   int length = end - begin;
   if (length <= 0) return empty_string();
-  if (length == 1) {
+  if (length == 1 && tainttracking::kInternalizedStringsEnabled) {
     return LookupSingleCharacterStringFromCode(str->Get(begin));
   }
-  if (length == 2) {
+  if (length == 2 && tainttracking::kInternalizedStringsEnabled) {
     // Optimization for 2-byte strings often used as keys in a decompression
     // dictionary.  Check whether we already have the string in the string
     // table to prevent creation of many unnecessary strings.
@@ -626,6 +721,7 @@ Handle<String> Factory::NewProperSubString(Handle<String> str,
       uint8_t* dest = result->GetChars();
       DisallowHeapAllocation no_gc;
       String::WriteToFlat(*str, dest, begin, end);
+      tainttracking::OnNewSubStringCopy(*str, *result, begin, length);
       return result;
     } else {
       Handle<SeqTwoByteString> result =
@@ -633,6 +729,7 @@ Handle<String> Factory::NewProperSubString(Handle<String> str,
       uc16* dest = result->GetChars();
       DisallowHeapAllocation no_gc;
       String::WriteToFlat(*str, dest, begin, end);
+      tainttracking::OnNewSubStringCopy(*str, *result, begin, length);
       return result;
     }
   }
@@ -655,6 +752,10 @@ Handle<String> Factory::NewProperSubString(Handle<String> str,
   slice->set_length(length);
   slice->set_parent(*str);
   slice->set_offset(offset);
+  {
+    DisallowHeapAllocation no_gc;
+    tainttracking::OnNewSlicedString(*slice, *str, offset, length);
+  }
   return slice;
 }
 
@@ -678,6 +779,9 @@ MaybeHandle<String> Factory::NewExternalStringFromOneByte(
   external_string->set_length(static_cast<int>(length));
   external_string->set_hash_field(String::kEmptyHashField);
   external_string->set_resource(resource);
+
+  DisallowHeapAllocation no_gc;
+  tainttracking::OnNewExternalString(*external_string);
 
   return external_string;
 }
@@ -710,6 +814,9 @@ MaybeHandle<String> Factory::NewExternalStringFromTwoByte(
   external_string->set_hash_field(String::kEmptyHashField);
   external_string->set_resource(resource);
 
+  DisallowHeapAllocation no_gc;
+  tainttracking::OnNewExternalString(*external_string);
+
   return external_string;
 }
 
@@ -724,6 +831,9 @@ Handle<ExternalOneByteString> Factory::NewNativeSourceString(
   external_string->set_length(static_cast<int>(length));
   external_string->set_hash_field(String::kEmptyHashField);
   external_string->set_resource(resource);
+
+  DisallowHeapAllocation no_gc;
+  tainttracking::OnNewExternalString(*external_string);
 
   return external_string;
 }
@@ -813,7 +923,17 @@ Handle<Context> Factory::NewCatchContext(Handle<JSFunction> function,
                                          Handle<String> name,
                                          Handle<Object> thrown_object) {
   STATIC_ASSERT(Context::MIN_CONTEXT_SLOTS == Context::THROWN_OBJECT_INDEX);
-  Handle<FixedArray> array = NewFixedArray(Context::MIN_CONTEXT_SLOTS + 1);
+
+  bool is_rewrite_enabled =
+    tainttracking::TaintTracker::FromIsolate(isolate())->
+    IsRewriteAstEnabled();
+  size_t size = Context::MIN_CONTEXT_SLOTS + 1;
+  if (is_rewrite_enabled) {
+    // Extra slot for the symbolic argument of the thrown exception
+    size += 1;
+  }
+
+  Handle<FixedArray> array = NewFixedArray(size);
   array->set_map_no_write_barrier(*catch_context_map());
   Handle<Context> context = Handle<Context>::cast(array);
   context->set_closure(*function);
@@ -821,6 +941,12 @@ Handle<Context> Factory::NewCatchContext(Handle<JSFunction> function,
   context->set_extension(*name);
   context->set_native_context(previous->native_context());
   context->set(Context::THROWN_OBJECT_INDEX, *thrown_object);
+
+  if (is_rewrite_enabled) {
+    // Extra slot for the symbolic argument of the thrown exception
+    tainttracking::RuntimeOnCatch(isolate(), thrown_object, context);
+  }
+
   return context;
 }
 
@@ -2115,6 +2241,8 @@ Handle<SharedFunctionInfo> Factory::NewSharedFunctionInfo(
   share->set_script(*undefined_value(), SKIP_WRITE_BARRIER);
   share->set_debug_info(DebugInfo::uninitialized(), SKIP_WRITE_BARRIER);
   share->set_function_identifier(*undefined_value(), SKIP_WRITE_BARRIER);
+  share->set_taint_node_label(*undefined_value(), SKIP_WRITE_BARRIER);
+
   StaticFeedbackVectorSpec empty_spec;
   Handle<TypeFeedbackMetadata> feedback_metadata =
       TypeFeedbackMetadata::New(isolate(), &empty_spec);
@@ -2137,6 +2265,7 @@ Handle<SharedFunctionInfo> Factory::NewSharedFunctionInfo(
   // All compiler hints default to false or 0.
   share->set_compiler_hints(0);
   share->set_opt_count_and_bailout_reason(0);
+
 
   // Link into the list.
   Handle<Object> new_noscript_list =

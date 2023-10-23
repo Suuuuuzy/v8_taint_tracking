@@ -1,7 +1,6 @@
 // Copyright 2016 the V8 project authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
-
 #include "src/snapshot/code-serializer.h"
 
 #include <memory>
@@ -10,6 +9,7 @@
 #include "src/log.h"
 #include "src/macro-assembler.h"
 #include "src/snapshot/deserializer.h"
+#include "src/taint_tracking.h"
 #include "src/version.h"
 
 namespace v8 {
@@ -259,7 +259,8 @@ SerializedCodeData::SerializedCodeData(const List<byte>* payload,
 
   // Set header values.
   SetMagicNumber(cs->isolate());
-  SetHeaderValue(kVersionHashOffset, Version::Hash());
+  SetHeaderValue(kVersionHashOffset,
+                 Version::Hash() ^ tainttracking::LayoutVersionHash());
   SetHeaderValue(kSourceHashOffset, SourceHash(cs->source()));
   SetHeaderValue(kCpuFeaturesOffset,
                  static_cast<uint32_t>(CpuFeatures::SupportedFeatures()));
@@ -297,7 +298,11 @@ SerializedCodeData::SanityCheckResult SerializedCodeData::SanityCheck(
   uint32_t flags_hash = GetHeaderValue(kFlagHashOffset);
   uint32_t c1 = GetHeaderValue(kChecksum1Offset);
   uint32_t c2 = GetHeaderValue(kChecksum2Offset);
-  if (version_hash != Version::Hash()) return VERSION_MISMATCH;
+  if (version_hash != (Version::Hash() ^
+                       tainttracking::LayoutVersionHash()) ||
+      !tainttracking::AllowDeserializingCode()) {
+    return VERSION_MISMATCH;
+  }
   if (source_hash != SourceHash(source)) return SOURCE_MISMATCH;
   if (cpu_features != static_cast<uint32_t>(CpuFeatures::SupportedFeatures())) {
     return CPU_FEATURES_MISMATCH;

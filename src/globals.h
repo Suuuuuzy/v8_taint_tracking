@@ -30,6 +30,63 @@
 # define V8_INFINITY INFINITY
 #endif
 
+namespace tainttracking {
+enum FrameType {
+  // From the JIT compiler called from JavaScript
+  JS,
+  JS_CALL_NEW,
+  JS_CALL_RUNTIME,
+
+  // Special case for the native context
+  TOP_LEVEL,
+
+  // Special case for property getters/setters
+  SETTER_ACCESSOR,
+  GETTER_ACCESSOR,
+
+  // Special case for implicit calls to toString in the left or right hand of a
+  // plus operation.
+  TO_STRING_CONVERT_PLUS_LEFT,
+  TO_STRING_CONVERT_PLUS_RIGHT,
+
+  // Special case for Runtime::Call
+  RUNTIME_CALL,
+
+  // Special cases of builtins in builtins-x64.cc
+  BUILTIN_CALL_OR_APPLY,
+
+  BUILTIN_REFLECT_APPLY,
+  BUILTIN_REFLECT_CONSTRUCT,
+  BUILTIN_APPLY,
+  BUILTIN_CALL,
+  BUILTIN_CONSTRUCT,
+  BUILTIN_CALL_FUNCTION,
+  BUILTIN_CALL_BOUND_FUNCTION,
+  BUILTIN_CONSTRUCT_FUNCTION,
+  BUILTIN_FUNCTION_PROTOTYPE_CALL,
+  BUILTIN_FUNCTION_PROTOTYPE_APPLY,
+  BUILTIN_JS_TRAMPOLINE,
+  BUILTIN_INVOKE_FUNCTION_CODE,
+
+  // The following types need literal arguments
+
+  // A call to Execution::Call that is not instrumented
+  UNKNOWN_CAPI,
+
+  // Execution::New
+  UNKNOWN_CAPI_NEW,
+
+  // A call to Builtins::InvokeApiFunction
+  UNKNOWN_EXTERNAL,
+
+
+  FIRST_NEEDS_LITERAL = UNKNOWN_CAPI,
+  FIRST_NEEDS_AUTO_EXIT = BUILTIN_REFLECT_APPLY,
+  LAST_NEEDS_AUTO_EXIT = BUILTIN_INVOKE_FUNCTION_CODE,
+};
+}
+
+
 namespace v8 {
 
 namespace base {

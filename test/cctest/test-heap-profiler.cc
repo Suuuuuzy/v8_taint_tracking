@@ -914,7 +914,8 @@ class TestJSONStream : public v8::OutputStream {
   int abort_countdown_;
 };
 
-class OneByteResource : public v8::String::ExternalOneByteStringResource {
+class OneByteResource : public v8::String::ExternalOneByteStringResource,
+                          public v8::String::TaintTrackingStringBufferImpl {
  public:
   explicit OneByteResource(i::Vector<char> string) : data_(string.start()) {
     length_ = string.length();

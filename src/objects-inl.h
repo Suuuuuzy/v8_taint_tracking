@@ -1061,9 +1061,11 @@ MaybeHandle<Name> Object::ToName(Isolate* isolate, Handle<Object> input) {
 
 // static
 MaybeHandle<Object> Object::ToPrimitive(Handle<Object> input,
-                                        ToPrimitiveHint hint) {
+                                        ToPrimitiveHint hint,
+                                        tainttracking::FrameType frame_type) {
   if (input->IsPrimitive()) return input;
-  return JSReceiver::ToPrimitive(Handle<JSReceiver>::cast(input), hint);
+  return JSReceiver::ToPrimitive(
+      Handle<JSReceiver>::cast(input), hint, frame_type);
 }
 
 
@@ -3529,6 +3531,14 @@ NOBARRIER_SMI_ACCESSORS(FreeSpace, size, kSizeOffset)
 SMI_ACCESSORS(String, length, kLengthOffset)
 SYNCHRONIZED_SMI_ACCESSORS(String, length, kLengthOffset)
 
+inline int64_t Name::taint_info() const {
+  return READ_INT64_FIELD(this, String::kTaintInfoOffset);
+}
+
+inline void Name::set_taint_info(int64_t value) {
+  WRITE_INT64_FIELD(this, String::kTaintInfoOffset, value);
+}
+
 
 int FreeSpace::Size() { return size(); }
 
@@ -3768,6 +3778,15 @@ Address SeqOneByteString::GetCharsAddress() {
   return FIELD_ADDR(this, kHeaderSize);
 }
 
+byte* SeqOneByteString::GetTaintChars() {
+  return reinterpret_cast<byte*>(FIELD_ADDR(
+          this, kHeaderSize + (length() * kCharSize)));
+}
+
+byte* SeqTwoByteString::GetTaintChars() {
+  return reinterpret_cast<byte*>(FIELD_ADDR(
+          this, kHeaderSize + (length() * kShortSize)));
+}
 
 uint8_t* SeqOneByteString::GetChars() {
   return reinterpret_cast<uint8_t*>(GetCharsAddress());
@@ -3859,7 +3878,7 @@ bool ExternalString::is_short() {
 }
 
 
-const ExternalOneByteString::Resource* ExternalOneByteString::resource() {
+ExternalOneByteString::Resource* ExternalOneByteString::resource() {
   return *reinterpret_cast<Resource**>(FIELD_ADDR(this, kResourceOffset));
 }
 
@@ -3892,7 +3911,7 @@ uint16_t ExternalOneByteString::ExternalOneByteStringGet(int index) {
 }
 
 
-const ExternalTwoByteString::Resource* ExternalTwoByteString::resource() {
+ExternalTwoByteString::Resource* ExternalTwoByteString::resource() {
   return *reinterpret_cast<Resource**>(FIELD_ADDR(this, kResourceOffset));
 }
 
@@ -5829,6 +5848,7 @@ ACCESSORS(SharedFunctionInfo, optimized_code_map, FixedArray,
 ACCESSORS(SharedFunctionInfo, construct_stub, Code, kConstructStubOffset)
 ACCESSORS(SharedFunctionInfo, feedback_metadata, TypeFeedbackMetadata,
           kFeedbackMetadataOffset)
+ACCESSORS(SharedFunctionInfo, taint_node_label, Object, kTaintTrackingNodeLabel)
 #if TRACE_MAPS
 SMI_ACCESSORS(SharedFunctionInfo, unique_id, kUniqueIdOffset)
 #endif
@@ -8109,7 +8129,6 @@ String::SubStringRange::iterator String::SubStringRange::begin() {
 String::SubStringRange::iterator String::SubStringRange::end() {
   return String::SubStringRange::iterator(string_, first_ + length_);
 }
-
 
 // Predictably converts HeapObject* or Address to uint32 by calculating
 // offset of the address in respective MemoryChunk.

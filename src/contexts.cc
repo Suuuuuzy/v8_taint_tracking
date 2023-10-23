@@ -184,7 +184,8 @@ static PropertyAttributes GetAttributesForMode(VariableMode mode) {
 Handle<Object> Context::Lookup(Handle<String> name, ContextLookupFlags flags,
                                int* index, PropertyAttributes* attributes,
                                InitializationFlag* init_flag,
-                               VariableMode* variable_mode) {
+                               VariableMode* variable_mode,
+                               int* symbolic_index) {
   Isolate* isolate = GetIsolate();
   Handle<Context> context(this, isolate);
 
@@ -235,6 +236,9 @@ Handle<Object> Context::Lookup(Handle<String> name, ContextLookupFlags flags,
           *variable_mode = r.mode;
           *init_flag = r.init_flag;
           *attributes = GetAttributesForMode(r.mode);
+          if (symbolic_index) {
+            *symbolic_index = r.taint_symbolic_index;
+          }
           return ScriptContextTable::GetContext(script_contexts,
                                                 r.context_index);
         }
@@ -303,6 +307,9 @@ Handle<Object> Context::Lookup(Handle<String> name, ContextLookupFlags flags,
         *variable_mode = mode;
         *init_flag = flag;
         *attributes = GetAttributesForMode(mode);
+        if (symbolic_index) {
+          *symbolic_index = scope_info->SymbolicSlotFor(*index);
+        }
         return context;
       }
 
@@ -321,6 +328,9 @@ Handle<Object> Context::Lookup(Handle<String> name, ContextLookupFlags flags,
           DCHECK(mode == CONST_LEGACY || mode == CONST);
           *init_flag = kCreatedInitialized;
           *variable_mode = mode;
+          if (symbolic_index) {
+            *symbolic_index = scope_info->SymbolicSlotFor(*index);
+          }
           return context;
         }
       }
@@ -335,6 +345,9 @@ Handle<Object> Context::Lookup(Handle<String> name, ContextLookupFlags flags,
         *attributes = NONE;
         *init_flag = kCreatedInitialized;
         *variable_mode = VAR;
+        if (symbolic_index) {
+          *symbolic_index = Context::kNotFound;
+        }
         return context;
       }
     } else if (context->IsDebugEvaluateContext()) {
@@ -354,7 +367,8 @@ Handle<Object> Context::Lookup(Handle<String> name, ContextLookupFlags flags,
       if (obj->IsContext()) {
         Handle<Object> result =
             Context::cast(obj)->Lookup(name, DONT_FOLLOW_CHAINS, index,
-                                       attributes, init_flag, variable_mode);
+                                       attributes, init_flag, variable_mode,
+                                       symbolic_index);
         if (!result.is_null()) return result;
       }
       // Check whitelist. Names that do not pass whitelist shall only resolve

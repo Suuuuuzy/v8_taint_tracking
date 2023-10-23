@@ -15,6 +15,7 @@
 #ifndef INCLUDE_V8_H_
 #define INCLUDE_V8_H_
 
+#include <memory>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -2090,7 +2091,8 @@ enum class NewStringType { kNormal, kInternalized };
  */
 class V8_EXPORT String : public Name {
  public:
-  static const int kMaxLength = (1 << 28) - 16;
+  /* Changed to match v8::internal::String::kMaxLength */
+  static const int kMaxLength = (1 << 28) - 18;
 
   enum Encoding {
     UNKNOWN_ENCODING = 0x1,
@@ -2188,8 +2190,171 @@ class V8_EXPORT String : public Name {
    */
   bool IsExternalOneByte() const;
 
-  class V8_EXPORT ExternalStringResourceBase {  // NOLINT
+  typedef uint8_t TaintData;
+
+
+  // A taint type stores a single byte of taint information about a single
+  // character of string data. The most significant three bits are used for the
+  // encoding and the last significant 5 bits are used for the taint type.
+  //
+  // 0 0 0      0 0 0 0 0
+  // \___/      \_______/
+  //   |            |
+  // encoding    taint type
+  //
+  // Must be kept in sync with
+  // ../../third_party/WebKit/Source/wtf/text/TaintTracking.h
+  enum TaintType {
+    UNTAINTED = 0,
+    TAINTED = 1,
+    COOKIE = 2,
+    MESSAGE = 3,
+    URL = 4,
+    URL_HASH = 5,
+    URL_PROTOCOL = 6,
+    URL_HOST = 7,
+    URL_HOSTNAME = 8,
+    URL_ORIGIN = 9,
+    URL_PORT = 10,
+    URL_PATHNAME = 11,
+    URL_SEARCH = 12,
+    DOM = 13,
+    REFERRER = 14,
+    WINDOWNAME = 15,
+    STORAGE = 16,
+    NETWORK = 17,
+    MULTIPLE_TAINTS = 18,       // Used when combining multiple bytes with
+                                // different taints.
+    MESSAGE_ORIGIN = 19,
+
+    // This must be less than the value of URL_ENCODED
+    MAX_TAINT_TYPE = 20,
+
+    // Encoding types
+    URL_ENCODED = 32,            // 1 << 5
+    URL_COMPONENT_ENCODED = 64,  // 2 << 5
+    ESCAPE_ENCODED = 96,         // 3 << 5
+    MULTIPLE_ENCODINGS = 128,    // 4 << 5
+    URL_DECODED = 160,           // 5 << 5
+    URL_COMPONENT_DECODED = 192, // 6 << 5
+    ESCAPE_DECODED = 224,        // 7 << 5
+
+    NO_ENCODING = 0,            // Must use the encoding mask to compare to no
+                                // encoding.
+
+    // Masks
+    TAINT_TYPE_MASK = 31,       // 1 << 5 - 1 (all ones in lower 5 bits)
+    ENCODING_TYPE_MASK = 224   // 7 << 5 (all ones in top 3 bits)
+  };
+
+  enum TaintSinkLabel {
+    URL_SINK,
+    EMBED_SRC_SINK,
+    IFRAME_SRC_SINK,
+    ANCHOR_SRC_SINK,
+    IMG_SRC_SINK,
+    SCRIPT_SRC_URL_SINK,
+
+    JAVASCRIPT,
+    JAVASCRIPT_EVENT_HANDLER_ATTRIBUTE,
+    JAVASCRIPT_SET_TIMEOUT,
+    JAVASCRIPT_SET_INTERVAL,
+
+    HTML,
+    MESSAGE_DATA,
+    COOKIE_SINK,
+    STORAGE_SINK,
+    ORIGIN,
+    DOM_URL,
+    JAVASCRIPT_URL,
+    ELEMENT,
+    CSS,
+    CSS_STYLE_ATTRIBUTE,
+    LOCATION_ASSIGNMENT
+  };
+
+  void WriteTaint(TaintData* buffer,
+                  int start = 0,
+                  int length = -1) const;
+
+  int64_t GetTaintInfo() const;
+
+  template <typename Char>
+  static int64_t LogIfBufferTainted(TaintData* buffer,
+                                    Char* stringdata,
+                                    size_t length,
+
+                                    // Should be retrieved from the function
+                                    // arguments.
+                                    int symbolic_data,
+                                    v8::Isolate* isolate,
+                                    TaintSinkLabel label);
+
+  // Returns -1 if not tainted. Otherwise returns the message ID of the logged
+  // message.
+  int64_t LogIfTainted(TaintSinkLabel label,
+
+                       // Should be the index of the function arguments
+                       int symbolic_data);
+  static void SetTaint(v8::Local<v8::Value> val,
+                       v8::Isolate* isolate,
+                       TaintType type);
+  static void SetTaintInfo(v8::Local<v8::Value> val,
+                           int64_t info);
+
+  static int64_t NewUniqueId(v8::Isolate* isolate);
+
+  class V8_EXPORT TaintTrackingBase {
+  public:
+
+    virtual ~TaintTrackingBase() {};
+
+    /**
+     * Return the taint information. May return NULL if untainted.
+     */
+    virtual TaintData* GetTaintChars() const = 0;
+
+    /**
+     * Return the taint information for writing. May not return NULL.
+     */
+    virtual TaintData* InitTaintChars(size_t) = 0;
+  };
+
+  // Inherit from this class to get an implementation of the taint tracking
+  // interface that stores a malloc-ed pointer on Set.
+  class V8_EXPORT TaintTrackingStringBufferImpl :
+    public virtual TaintTrackingBase {
+  public:
+
+    TaintTrackingStringBufferImpl() : taint_data_(nullptr) {}
+
+    virtual TaintData* GetTaintChars() const {
+      return taint_data_.get();
+    }
+
+    virtual TaintData* InitTaintChars(size_t length) {
+      TaintData* answer = taint_data_.get();
+      if (!taint_data_) {
+        answer = new TaintData[length];
+        taint_data_.reset(answer);
+        return answer;
+      } else {
+        return answer;
+      }
+    }
+
+    virtual void SetTaintChars(TaintData* buffer) {
+      taint_data_.reset(buffer);
+    }
+
+  private:
+    std::unique_ptr<TaintData> taint_data_;
+  };
+
+  class V8_EXPORT ExternalStringResourceBase
+    : public virtual TaintTrackingBase {  // NOLINT
    public:
+
     virtual ~ExternalStringResourceBase() {}
 
     virtual bool IsCompressible() const { return false; }
@@ -2203,7 +2368,9 @@ class V8_EXPORT String : public Name {
      * delete operator. This method can be overridden in subclasses to
      * control how allocated external string resources are disposed.
      */
-    virtual void Dispose() { delete this; }
+    virtual void Dispose() {
+      delete this;
+    }
 
    private:
     // Disallow copying and assigning.
@@ -2264,6 +2431,7 @@ class V8_EXPORT String : public Name {
     virtual const char* data() const = 0;
     /** The number of Latin-1 characters in the string.*/
     virtual size_t length() const = 0;
+
    protected:
     ExternalOneByteStringResource() {}
   };
@@ -2447,6 +2615,11 @@ class V8_EXPORT String : public Name {
                                         Encoding encoding) const;
   void VerifyExternalStringResource(ExternalStringResource* val) const;
   static void CheckCast(v8::Value* obj);
+};
+
+class V8_EXPORT TaintTracking {
+ public:
+  static void LogInitializeNavigate(v8::Local<v8::String> url);
 };
 
 
@@ -4902,10 +5075,13 @@ class V8_EXPORT AccessorSignature : public Data {
 // --- Extensions ---
 
 class V8_EXPORT ExternalOneByteStringResourceImpl
-    : public String::ExternalOneByteStringResource {
+  : public String::ExternalOneByteStringResource,
+      public String::TaintTrackingStringBufferImpl {
  public:
-  ExternalOneByteStringResourceImpl() : data_(0), length_(0) {}
-  ExternalOneByteStringResourceImpl(const char* data, size_t length)
+  ExternalOneByteStringResourceImpl()
+    : data_(0), length_(0) {}
+  ExternalOneByteStringResourceImpl(
+      const char* data, size_t length)
       : data_(data), length_(length) {}
   const char* data() const { return data_; }
   size_t length() const { return length_; }
@@ -7232,6 +7408,10 @@ class V8_EXPORT Context {
   /** Returns the security token of this context.*/
   Local<Value> GetSecurityToken();
 
+  /** Used by tainttracking logging to identify different execution contexts **/
+  void SetTaintTrackingContextId(Local<Value> token);
+
+
   /**
    * Enter this context.  After entering a context, all code compiled
    * and run is compiled and run in this context.  If another context
@@ -7571,7 +7751,8 @@ class Internals {
   static const int kHeapObjectMapOffset = 0;
   static const int kMapInstanceTypeAndBitFieldOffset =
       1 * kApiPointerSize + kApiIntSize;
-  static const int kStringResourceOffset = 3 * kApiPointerSize;
+
+  static const int kStringResourceOffset = 4 * kApiPointerSize;
 
   static const int kOddballKindOffset = 4 * kApiPointerSize + sizeof(double);
   static const int kForeignAddressOffset = kApiPointerSize;

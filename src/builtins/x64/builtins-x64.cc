@@ -8,11 +8,215 @@
 #include "src/codegen.h"
 #include "src/deoptimizer.h"
 #include "src/full-codegen/full-codegen.h"
+#include "src/taint_tracking.h"
 
 namespace v8 {
 namespace internal {
 
 #define __ ACCESS_MASM(masm)
+
+
+namespace {
+
+
+inline void GenerateTaintTrackingPrepareApply(
+    MacroAssembler* masm, tainttracking::FrameType caller_frame_type) {
+  #ifdef V8_TAINT_TRACKING_INCLUDE_CONCOLIC
+
+  // ----------- S t a t e -------------
+  //  -- rax    : argumentsList
+  //  -- rdi    : target
+  //  -- rdx    : new.target (checked to be constructor or undefined)
+  //  -- rsp[0] : return address.
+  //  -- rsp[8] : thisArgument
+  // -----------------------------------
+
+
+  __ movp(rcx, Operand(rsp, kPointerSize));
+
+  // Store caller save registers
+  __ Push(rax);
+  __ Push(rdx);
+  __ Push(rdi);
+
+  {
+    FrameScope scope(masm, StackFrame::INTERNAL);
+
+    // Push arguments to runtime call
+    __ Push(rax); // argumentsList
+    __ Push(rdi); // target
+    __ Push(rdx); // new.target
+    __ Push(rcx); // thisArgument
+
+    __ Push(Smi::FromInt(static_cast<int>(caller_frame_type)));
+
+    __ CallRuntime(Runtime::kTaintTrackingPrepareApply, 5);
+  }
+
+  // Restore caller save registers
+  __ Pop(rdi);
+  __ Pop(rdx);
+  __ Pop(rax);
+
+  #endif
+}
+
+
+#ifdef V8_TAINT_TRACKING_INCLUDE_CONCOLIC
+inline void GeneratePushArgumentLoop(MacroAssembler* masm, Register scratch) {
+  // ----------- S t a t e -------------
+  //  -- rax                 : the number of arguments (not including the receiver)
+  //
+  //  -- rsp[0]              : return address
+  //  -- rsp[8]              : last argument
+  //  -- ...
+  //  -- rsp[8 * argc]       : first argument
+  //  -- rsp[8 * (argc + 1)] : receiver
+  // -----------------------------------
+
+
+  // Loop through all the arguments starting from rsp[8 * argc] and going to
+  // rsp[8].
+  Label loop, done;
+  __ testp(rax, rax);
+  __ j(zero, &done, Label::kNear);
+  __ movp(scratch, rax);
+  __ bind(&loop);
+
+  // Push rsp[scratch * kPointerSize]
+  __ Push(Operand(r11, scratch, times_pointer_size, 0));
+  __ decp(scratch);
+  __ j(not_zero, &loop);              // While non-zero.
+  __ bind(&done);
+}
+#endif
+
+inline void GenerateTaintTrackingPrepareCall(
+    MacroAssembler* masm, tainttracking::FrameType caller_frame_type) {
+  #ifdef V8_TAINT_TRACKING_INCLUDE_CONCOLIC
+
+  // ----------- S t a t e -------------
+  //  -- rax                 : argc, the number of arguments (not including the receiver)
+  //  -- rdi                 : the target to call (can be any Object)
+  //
+  //  -- rsp[0]              : return address
+  //  -- rsp[8]              : last argument
+  //  -- ...
+  //  -- rsp[8 * argc]       : first argument
+  //  -- rsp[8 * (argc + 1)] : receiver
+  // -----------------------------------
+
+
+  {
+    __ movp(r11, rsp);
+    FrameScope scope(masm, StackFrame::INTERNAL);
+
+    // Store caller save registers
+    __ Push(rax);
+    __ Push(rdi);
+    __ Push(rdx);
+    __ Push(rbx);
+
+    // Push arguments to prepare call
+    __ Push(rdi);
+    __ Push(Smi::FromInt(static_cast<int>(caller_frame_type)));
+    __ Push(Operand(r11, rax, times_pointer_size, kPointerSize));
+    GeneratePushArgumentLoop(masm, rcx);
+
+    // Add to rax the number of additional arguments
+    __ addp(rax, Immediate(3));
+
+    __ CallRuntime(Runtime::kTaintTrackingPrepareCall);
+
+    // Restore caller save registers
+    __ Pop(rbx);
+    __ Pop(rdx);
+    __ Pop(rdi);
+    __ Pop(rax);
+  }
+
+  #endif
+}
+
+inline void GenerateTaintTrackingPrepareCallOrConstruct(MacroAssembler* masm) {
+  #ifdef V8_TAINT_TRACKING_INCLUDE_CONCOLIC
+
+  // ----------- S t a t e -------------
+  //  -- rax        : the number of arguments (not including the receiver)
+  //  -- rdi        : the target to call (can be any Object)
+  //  -- rdx        : new.target - If undefined, then prepare for call,
+  //                  otherwise for construct
+  //  -- rsp        : return address
+  //  -- rsp[8 * n] : arguments to call
+  // -----------------------------------
+
+
+  // Store caller save registers
+
+  {
+    __ movp(r11, rsp);
+    FrameScope scope(masm, StackFrame::INTERNAL);
+
+    __ Push(rax);
+    __ Push(rdx);
+    __ Push(rdi);
+
+
+    // Push arguments to prepare call
+    __ Push(rdi);                 // the target to call
+    __ Push(rdx);                 // if undefined, then prepare for call
+                                  // otherwise for a construct call
+
+    // Push arguments from stack frame
+    GeneratePushArgumentLoop(masm, rcx);
+
+    // Add 2 to rax to reflect that the runtime call has 2 more arguments than
+    // the expected number because of the pushed rdi and rdx value
+    __ addp(rax, Immediate(2));
+
+    // Make the call
+    __ CallRuntime(Runtime::kTaintTrackingPrepareCallOrConstruct);
+
+
+    // Restore caller save registers in opposite order
+    __ Pop(rdi);
+    __ Pop(rdx);
+    __ Pop(rax);
+  }
+
+  #endif
+}
+
+inline void GenerateTaintTrackingSetReceiver(MacroAssembler* masm) {
+  #ifdef V8_TAINT_TRACKING_INCLUDE_CONCOLIC
+
+  // State:
+  //
+  // rbx -- new receiver
+
+  FrameScope scope (masm, StackFrame::INTERNAL);
+
+  // Save caller registers
+  __ Push(rax);
+  __ Push(rdx);
+  __ Push(rdi);
+  __ Push(rbx);
+
+  // Push rbx and make the call
+  __ Push(rbx);
+  __ CallRuntime(Runtime::kTaintTrackingAddLiteralReceiver);
+
+  // Restore caller registers
+  __ Pop(rbx);
+  __ Pop(rdi);
+  __ Pop(rdx);
+  __ Pop(rax);
+
+  #endif
+}
+
+}
+
 
 void Builtins::Generate_Adaptor(MacroAssembler* masm, Address address,
                                 ExitFrameType exit_frame_type) {
@@ -139,6 +343,8 @@ static void Generate_JSConstructStubHelper(MacroAssembler* masm,
       FastNewObjectStub stub(masm->isolate());
       __ CallStub(&stub);
       __ movp(rbx, rax);
+
+      GenerateTaintTrackingSetReceiver(masm);
       __ Pop(rdx);
       __ Pop(rdi);
 
@@ -414,6 +620,13 @@ static void Generate_JSEntryTrampolineHelper(MacroAssembler* masm,
     __ bind(&entry);
     __ cmpp(rcx, rax);
     __ j(not_equal, &loop);
+
+    if (is_construct) {
+      // TODO: prepare for construct
+    } else {
+      // GenerateTaintTrackingPrepareCall(
+      //     masm, tainttracking::FrameType::BUILTIN_JS_TRAMPOLINE);
+    }
 
     // Invoke the builtin code.
     Handle<Code> builtin = is_construct
@@ -1339,22 +1552,30 @@ void Builtins::Generate_FunctionPrototypeApply(MacroAssembler* masm) {
   // -----------------------------------
 
   // 2. Make sure the receiver is actually callable.
+  // billy: Removing the kNear tag to these two function calls because the
+  // GenerateTaintTrackingPrepareApply hook causes the tag to be not near
   Label receiver_not_callable;
-  __ JumpIfSmi(rdi, &receiver_not_callable, Label::kNear);
+  __ JumpIfSmi(rdi, &receiver_not_callable);
   __ movp(rcx, FieldOperand(rdi, HeapObject::kMapOffset));
   __ testb(FieldOperand(rcx, Map::kBitFieldOffset),
            Immediate(1 << Map::kIsCallable));
-  __ j(zero, &receiver_not_callable, Label::kNear);
+  __ j(zero, &receiver_not_callable);
 
   // 3. Tail call with no arguments if argArray is null or undefined.
   Label no_arguments;
-  __ JumpIfRoot(rax, Heap::kNullValueRootIndex, &no_arguments, Label::kNear);
-  __ JumpIfRoot(rax, Heap::kUndefinedValueRootIndex, &no_arguments,
-                Label::kNear);
+
+  // billy: Removing the kNear tag to these two function calls because the
+  // GenerateTaintTrackingPrepareApply hook causes the tag to be not near
+  __ JumpIfRoot(rax, Heap::kNullValueRootIndex, &no_arguments);
+  __ JumpIfRoot(rax, Heap::kUndefinedValueRootIndex, &no_arguments);
 
   // 4a. Apply the receiver to the given argArray (passing undefined for
   // new.target).
   __ LoadRoot(rdx, Heap::kUndefinedValueRootIndex);
+
+  GenerateTaintTrackingPrepareApply(
+      masm, tainttracking::FrameType::BUILTIN_FUNCTION_PROTOTYPE_APPLY);
+
   __ Jump(masm->isolate()->builtins()->Apply(), RelocInfo::CODE_TARGET);
 
   // 4b. The argArray is either null or undefined, so we tail call without any
@@ -1363,6 +1584,8 @@ void Builtins::Generate_FunctionPrototypeApply(MacroAssembler* masm) {
   __ bind(&no_arguments);
   {
     __ Set(rax, 0);
+    GenerateTaintTrackingPrepareCall(
+        masm, tainttracking::FrameType::BUILTIN_FUNCTION_PROTOTYPE_APPLY);
     __ Jump(masm->isolate()->builtins()->Call(), RelocInfo::CODE_TARGET);
   }
 
@@ -1421,6 +1644,9 @@ void Builtins::Generate_FunctionPrototypeCall(MacroAssembler* masm) {
     __ decp(rax);  // One fewer argument (first argument is new receiver).
   }
 
+  GenerateTaintTrackingPrepareCall(
+      masm, tainttracking::FrameType::BUILTIN_FUNCTION_PROTOTYPE_CALL);
+
   // 4. Call the callable.
   // Since we did not create a frame for Function.prototype.call() yet,
   // we use a normal Call builtin here.
@@ -1470,16 +1696,22 @@ void Builtins::Generate_ReflectApply(MacroAssembler* masm) {
   // -----------------------------------
 
   // 2. Make sure the target is actually callable.
+
+  // billy: Removing the kNear tag because the inserted hook to
+  // GenerateTaintTrackingPrepareApply causes the tags to not be near.
   Label target_not_callable;
-  __ JumpIfSmi(rdi, &target_not_callable, Label::kNear);
+  __ JumpIfSmi(rdi, &target_not_callable);
   __ movp(rcx, FieldOperand(rdi, HeapObject::kMapOffset));
   __ testb(FieldOperand(rcx, Map::kBitFieldOffset),
            Immediate(1 << Map::kIsCallable));
-  __ j(zero, &target_not_callable, Label::kNear);
+  __ j(zero, &target_not_callable);
 
   // 3a. Apply the target to the given argumentsList (passing undefined for
   // new.target).
   __ LoadRoot(rdx, Heap::kUndefinedValueRootIndex);
+
+  GenerateTaintTrackingPrepareApply(
+      masm, tainttracking::FrameType::BUILTIN_REFLECT_APPLY);
   __ Jump(masm->isolate()->builtins()->Apply(), RelocInfo::CODE_TARGET);
 
   // 3b. The target is not callable, throw an appropriate TypeError.
@@ -1537,22 +1769,26 @@ void Builtins::Generate_ReflectConstruct(MacroAssembler* masm) {
   // -----------------------------------
 
   // 2. Make sure the target is actually a constructor.
+  // billy: Removing the kNear tag because the inserted hook to
+  // GenerateTaintTrackingPrepareApply causes the tags to not be near.
   Label target_not_constructor;
-  __ JumpIfSmi(rdi, &target_not_constructor, Label::kNear);
+  __ JumpIfSmi(rdi, &target_not_constructor);
   __ movp(rcx, FieldOperand(rdi, HeapObject::kMapOffset));
   __ testb(FieldOperand(rcx, Map::kBitFieldOffset),
            Immediate(1 << Map::kIsConstructor));
-  __ j(zero, &target_not_constructor, Label::kNear);
+  __ j(zero, &target_not_constructor);
 
   // 3. Make sure the target is actually a constructor.
   Label new_target_not_constructor;
-  __ JumpIfSmi(rdx, &new_target_not_constructor, Label::kNear);
+  __ JumpIfSmi(rdx, &new_target_not_constructor);
   __ movp(rcx, FieldOperand(rdx, HeapObject::kMapOffset));
   __ testb(FieldOperand(rcx, Map::kBitFieldOffset),
            Immediate(1 << Map::kIsConstructor));
-  __ j(zero, &new_target_not_constructor, Label::kNear);
+  __ j(zero, &new_target_not_constructor);
 
   // 4a. Construct the target with the given new.target and argumentsList.
+  GenerateTaintTrackingPrepareApply(
+      masm, tainttracking::FrameType::BUILTIN_REFLECT_CONSTRUCT);
   __ Jump(masm->isolate()->builtins()->Apply(), RelocInfo::CODE_TARGET);
 
   // 4b. The target is not a constructor, throw an appropriate TypeError.
@@ -2391,6 +2627,7 @@ void Builtins::Generate_Apply(MacroAssembler* masm) {
 
   // Dispatch to Call or Construct depending on whether new.target is undefined.
   {
+    GenerateTaintTrackingPrepareCallOrConstruct(masm);
     __ CompareRoot(rdx, Heap::kUndefinedValueRootIndex);
     __ j(equal, masm->isolate()->builtins()->Call(), RelocInfo::CODE_TARGET);
     __ Jump(masm->isolate()->builtins()->Construct(), RelocInfo::CODE_TARGET);

@@ -33,6 +33,10 @@ uint32_t ExternalReferenceEncoder::Encode(Address address) const {
   DCHECK_NOT_NULL(address);
   base::HashMap::Entry* entry =
       const_cast<base::HashMap*>(map_)->Lookup(address, Hash(address));
+  if (nullptr == entry) {
+    (std::cerr << reinterpret_cast<void*>(address) << std::endl);
+    (std::cerr << Hash(address) << std::endl);
+  }
   DCHECK_NOT_NULL(entry);
   return static_cast<uint32_t>(reinterpret_cast<intptr_t>(entry->value));
 }

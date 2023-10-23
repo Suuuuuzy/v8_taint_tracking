@@ -10,6 +10,7 @@
 #include "src/handles.h"
 #include "src/isolate.h"
 #include "src/objects.h"
+#include "src/taint_tracking.h"
 #include "src/utils.h"
 
 namespace v8 {
@@ -28,7 +29,9 @@ typedef BitField<int, kStringBuilderConcatHelperLengthBits,
 template <typename sinkchar>
 static inline void StringBuilderConcatHelper(String* special, sinkchar* sink,
                                              FixedArray* fixed_array,
-                                             int array_length) {
+                                             int array_length,
+                                             tainttracking::TaintData* taint) {
+  /* TODO: log symbolic */
   DisallowHeapAllocation no_gc;
   int position = 0;
   for (int i = 0; i < array_length; i++) {
@@ -50,11 +53,15 @@ static inline void StringBuilderConcatHelper(String* special, sinkchar* sink,
         len = -encoded_slice;
       }
       String::WriteToFlat(special, sink + position, pos, pos + len);
+      tainttracking::FlattenTaintData(
+          special, taint + position, pos, len);
       position += len;
     } else {
       String* string = String::cast(element);
       int element_length = string->length();
       String::WriteToFlat(string, sink + position, 0, element_length);
+      tainttracking::FlattenTaintData(
+          string, taint + position, 0, element_length);
       position += element_length;
     }
   }
@@ -269,12 +276,14 @@ class ReplacementStringBuilder {
 
 class IncrementalStringBuilder {
  public:
+
   explicit IncrementalStringBuilder(Isolate* isolate);
 
   INLINE(String::Encoding CurrentEncoding()) { return encoding_; }
 
   template <typename SrcChar, typename DestChar>
-  INLINE(void Append(SrcChar c));
+  INLINE(void Append(SrcChar c,
+         tainttracking::TaintType type = tainttracking::TaintType::UNTAINTED));
 
   INLINE(void AppendCharacter(uint8_t c)) {
     if (encoding_ == String::ONE_BYTE_ENCODING) {
@@ -284,12 +293,14 @@ class IncrementalStringBuilder {
     }
   }
 
-  INLINE(void AppendCString(const char* s)) {
+  INLINE(void AppendCString(const char* s,
+         tainttracking::TaintType taint =
+         tainttracking::TaintType::UNTAINTED)) {
     const uint8_t* u = reinterpret_cast<const uint8_t*>(s);
     if (encoding_ == String::ONE_BYTE_ENCODING) {
-      while (*u != '\0') Append<uint8_t, uint8_t>(*(u++));
+      while (*u != '\0') Append<uint8_t, uint8_t>(*(u++), taint);
     } else {
-      while (*u != '\0') Append<uint8_t, uc16>(*(u++));
+      while (*u != '\0') Append<uint8_t, uc16>(*(u++), taint);
     }
   }
 
@@ -327,17 +338,28 @@ class IncrementalStringBuilder {
       if (sizeof(DestChar) == 1) {
         start_ = reinterpret_cast<DestChar*>(
             Handle<SeqOneByteString>::cast(string)->GetChars() + offset);
+        start_taint_ = tainttracking::GetWriteableStringTaintData(
+            *Handle<SeqOneByteString>::cast(string));
       } else {
         start_ = reinterpret_cast<DestChar*>(
             Handle<SeqTwoByteString>::cast(string)->GetChars() + offset);
+        start_taint_ = tainttracking::GetWriteableStringTaintData(
+            *Handle<SeqTwoByteString>::cast(string));
       }
       cursor_ = start_;
     }
 
-    INLINE(void Append(DestChar c)) { *(cursor_++) = c; }
-    INLINE(void AppendCString(const char* s)) {
+    INLINE(void Append(DestChar c,
+                       tainttracking::TaintType type =
+                       tainttracking::TaintType::UNTAINTED)) {
+      *(start_taint_++) = static_cast<tainttracking::TaintData>(type);
+      *(cursor_++) = c;
+    }
+    INLINE(void AppendCString(const char* s,
+           tainttracking::TaintType type =
+           tainttracking::TaintType::UNTAINTED)) {
       const uint8_t* u = reinterpret_cast<const uint8_t*>(s);
-      while (*u != '\0') Append(*(u++));
+      while (*u != '\0') Append(*(u++), type);
     }
 
     int written() { return static_cast<int>(cursor_ - start_); }
@@ -345,6 +367,7 @@ class IncrementalStringBuilder {
    private:
     DestChar* start_;
     DestChar* cursor_;
+    tainttracking::TaintData* start_taint_;
     DisallowHeapAllocation no_gc_;
   };
 
@@ -428,14 +451,17 @@ class IncrementalStringBuilder {
 
 
 template <typename SrcChar, typename DestChar>
-void IncrementalStringBuilder::Append(SrcChar c) {
+void IncrementalStringBuilder::Append(
+    SrcChar c, tainttracking::TaintType type) {
   DCHECK_EQ(encoding_ == String::ONE_BYTE_ENCODING, sizeof(DestChar) == 1);
   if (sizeof(DestChar) == 1) {
     DCHECK_EQ(String::ONE_BYTE_ENCODING, encoding_);
+    tainttracking::SetTaintStatus(*current_part_, current_index_, type);
     SeqOneByteString::cast(*current_part_)
         ->SeqOneByteStringSet(current_index_++, c);
   } else {
     DCHECK_EQ(String::TWO_BYTE_ENCODING, encoding_);
+    tainttracking::SetTaintStatus(*current_part_, current_index_, type);
     SeqTwoByteString::cast(*current_part_)
         ->SeqTwoByteStringSet(current_index_++, c);
   }

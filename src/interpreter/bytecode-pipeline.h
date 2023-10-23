@@ -58,17 +58,21 @@ class BytecodeSourceInfo final {
 
   BytecodeSourceInfo()
       : position_type_(PositionType::kNone),
-        source_position_(kUninitializedPosition) {}
+        source_position_(kUninitializedPosition),
+        ast_taint_tracking_index_(-1) {}
 
-  BytecodeSourceInfo(int source_position, bool is_statement)
+  BytecodeSourceInfo(int source_position, bool is_statement,
+                     int ast_taint_tracking_index)
       : position_type_(is_statement ? PositionType::kStatement
                                     : PositionType::kExpression),
-        source_position_(source_position) {
+        source_position_(source_position),
+        ast_taint_tracking_index_(ast_taint_tracking_index) {
     DCHECK_GE(source_position, 0);
   }
 
   // Makes instance into a statement position.
-  void MakeStatementPosition(int source_position) {
+  void MakeStatementPosition(int source_position,
+                             int ast_taint_tracking_index) {
     // Statement positions can be replaced by other statement
     // positions. For example , "for (x = 0; x < 3; ++x) 7;" has a
     // statement position associated with 7 but no bytecode associated
@@ -76,21 +80,26 @@ class BytecodeSourceInfo final {
     // statement position and overrides the existing one.
     position_type_ = PositionType::kStatement;
     source_position_ = source_position;
+    ast_taint_tracking_index_ = ast_taint_tracking_index;
   }
 
   // Makes instance into an expression position. Instance should not
   // be a statement position otherwise it could be lost and impair the
   // debugging experience.
-  void MakeExpressionPosition(int source_position) {
+  void MakeExpressionPosition(int source_position,
+                              int ast_taint_tracking_index) {
     DCHECK(!is_statement());
     position_type_ = PositionType::kExpression;
     source_position_ = source_position;
+    ast_taint_tracking_index_ = ast_taint_tracking_index;
   }
 
   // Forces an instance into an expression position.
-  void ForceExpressionPosition(int source_position) {
+  void ForceExpressionPosition(int source_position,
+                               int ast_taint_tracking_index) {
     position_type_ = PositionType::kExpression;
     source_position_ = source_position;
+    ast_taint_tracking_index_ = ast_taint_tracking_index;
   }
 
   // Clones a source position. The current instance is expected to be
@@ -99,6 +108,7 @@ class BytecodeSourceInfo final {
     DCHECK(!is_valid());
     position_type_ = other.position_type_;
     source_position_ = other.source_position_;
+    ast_taint_tracking_index_ = other.ast_taint_tracking_index_;
   }
 
   int source_position() const {
@@ -111,6 +121,10 @@ class BytecodeSourceInfo final {
   }
   bool is_expression() const {
     return position_type_ == PositionType::kExpression;
+  }
+
+  int ast_taint_tracking_index() const {
+    return ast_taint_tracking_index_;
   }
 
   bool is_valid() const { return position_type_ != PositionType::kNone; }
@@ -134,6 +148,7 @@ class BytecodeSourceInfo final {
 
   PositionType position_type_;
   int source_position_;
+  int ast_taint_tracking_index_;
 
   DISALLOW_COPY_AND_ASSIGN(BytecodeSourceInfo);
 };

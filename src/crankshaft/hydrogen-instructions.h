@@ -5373,6 +5373,13 @@ class HObjectAccess final {
         Representation::Smi());
   }
 
+  static HObjectAccess ForStringTaintInfo() {
+    return HObjectAccess(
+        kInobject,
+        Name::kTaintInfoOffset,
+        Representation::Smi());
+  }
+
   static HObjectAccess ForConsStringFirst() {
     return HObjectAccess(kInobject, ConsString::kFirstOffset);
   }

@@ -165,7 +165,8 @@ class BootstrapperActive final BASE_EMBEDDED {
 
 
 class NativesExternalStringResource final
-    : public v8::String::ExternalOneByteStringResource {
+  : public v8::String::ExternalOneByteStringResource,
+      public v8::String::TaintTrackingStringBufferImpl {
  public:
   NativesExternalStringResource(const char* source, size_t length)
       : data_(source), length_(length) {}

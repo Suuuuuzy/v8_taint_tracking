@@ -45,6 +45,11 @@ MaybeHandle<Object> CreateDynamicFunction(Isolate* isolate,
             isolate, param, Object::ToString(isolate, args.at<Object>(i)),
             Object);
         param = String::Flatten(param);
+
+        tainttracking::LogIfTainted(Handle<String>::cast(param),
+                                    tainttracking::TaintSinkLabel::JAVASCRIPT,
+                                    i - 1);
+
         builder.AppendString(param);
         // If the formal parameters string include ) - an illegal
         // character - it may make the combined function expression
@@ -69,6 +74,11 @@ MaybeHandle<Object> CreateDynamicFunction(Isolate* isolate,
       ASSIGN_RETURN_ON_EXCEPTION(
           isolate, body, Object::ToString(isolate, args.at<Object>(argc)),
           Object);
+
+      tainttracking::LogIfTainted(Handle<String>::cast(body),
+                                  tainttracking::TaintSinkLabel::JAVASCRIPT,
+                                  argc - 1);
+
       builder.AppendString(body);
     }
     builder.AppendCString("\n})");

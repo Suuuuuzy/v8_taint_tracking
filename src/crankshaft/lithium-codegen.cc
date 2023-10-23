@@ -141,7 +141,9 @@ void LCodeGenBase::CheckEnvironmentUsage() {
 
 void LCodeGenBase::RecordAndWritePosition(int pos) {
   if (pos == kNoSourcePosition) return;
-  source_position_table_builder_.AddPosition(masm_->pc_offset(), pos, false);
+  source_position_table_builder_.AddPosition(
+      masm_->pc_offset(), pos, false,
+      SourcePositionTableBuilder::NO_TAINT_TRACKING_INDEX);
 }
 
 void LCodeGenBase::Comment(const char* format, ...) {

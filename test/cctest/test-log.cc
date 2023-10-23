@@ -289,7 +289,9 @@ TEST(ProfMultipleThreads) {
 // We need to verify that LogCompiledFunctions doesn't crash on them.
 namespace {
 
-class SimpleExternalString : public v8::String::ExternalStringResource {
+class SimpleExternalString :
+      public v8::String::ExternalStringResource,
+      public v8::String::TaintTrackingStringBufferImpl {
  public:
   explicit SimpleExternalString(const char* source)
       : utf_source_(StrLength(source)) {

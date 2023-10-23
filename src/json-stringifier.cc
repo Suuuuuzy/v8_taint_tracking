@@ -96,7 +96,9 @@ MaybeHandle<Object> JsonStringifier::Stringify(Handle<Object> object,
   }
   Result result = SerializeObject(object);
   if (result == UNCHANGED) return factory()->undefined_value();
-  if (result == SUCCESS) return builder_.Finish();
+  if (result == SUCCESS) {
+      return builder_.Finish();
+  }
   DCHECK(result == EXCEPTION);
   return MaybeHandle<Object>();
 }
@@ -621,18 +623,22 @@ JsonStringifier::Result JsonStringifier::SerializeJSProxy(
 
 template <typename SrcChar, typename DestChar>
 void JsonStringifier::SerializeStringUnchecked_(
-    Vector<const SrcChar> src,
+    String* src,
     IncrementalStringBuilder::NoExtend<DestChar>* dest) {
   // Assert that uc16 character is not truncated down to 8 bit.
   // The <uc16, char> version of this method must not be called.
   DCHECK(sizeof(DestChar) >= sizeof(SrcChar));
 
-  for (int i = 0; i < src.length(); i++) {
-    SrcChar c = src[i];
+  // TODO: log symbolic
+  Vector<const SrcChar> vector = src->GetCharVector<SrcChar>();
+  for (int i = 0; i < vector.length(); i++) {
+    SrcChar c = vector[i];
+    tainttracking::TaintType type = tainttracking::GetTaintStatus(src, i);
     if (DoNotEscape(c)) {
-      dest->Append(c);
+      dest->Append(c, type);
     } else {
-      dest->AppendCString(&JsonEscapeTable[c * kJsonEscapeTableEntrySize]);
+      dest->AppendCString(
+              &JsonEscapeTable[c * kJsonEscapeTableEntrySize], type);
     }
   }
 }
@@ -648,18 +654,20 @@ void JsonStringifier::SerializeString_(Handle<String> string) {
   int worst_case_length = length << 3;
   if (builder_.CurrentPartCanFit(worst_case_length)) {
     DisallowHeapAllocation no_gc;
-    Vector<const SrcChar> vector = string->GetCharVector<SrcChar>();
     IncrementalStringBuilder::NoExtendBuilder<DestChar> no_extend(
         &builder_, worst_case_length);
-    SerializeStringUnchecked_(vector, &no_extend);
+    SerializeStringUnchecked_<SrcChar, DestChar>(*string, &no_extend);
   } else {
     FlatStringReader reader(isolate_, string);
+    // TODO: log symbolic
     for (int i = 0; i < reader.length(); i++) {
       SrcChar c = reader.Get<SrcChar>(i);
+      tainttracking::TaintType type = tainttracking::GetTaintStatus(*string, i);
       if (DoNotEscape(c)) {
-        builder_.Append<SrcChar, DestChar>(c);
+        builder_.Append<SrcChar, DestChar>(c, type);
       } else {
-        builder_.AppendCString(&JsonEscapeTable[c * kJsonEscapeTableEntrySize]);
+        builder_.AppendCString(
+                &JsonEscapeTable[c * kJsonEscapeTableEntrySize], type);
       }
     }
   }

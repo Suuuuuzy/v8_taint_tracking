@@ -5314,6 +5314,104 @@ int String::Write(uint16_t* buffer,
 }
 
 
+void String::WriteTaint(uint8_t* buffer,
+                        int start,
+                        int length) const {
+  ENTER_V8(Utils::OpenHandle(this)->GetIsolate());
+  i::Handle<i::String> thisstr = Utils::OpenHandle(this);
+  {
+    i::DisallowHeapAllocation no_gc;
+    if (length < 0) {
+      length = thisstr->length();
+    }
+    tainttracking::FlattenTaintData(*thisstr, buffer, start, length);
+  }
+}
+
+void String::SetTaintInfo(v8::Local<v8::Value> val,
+                          int64_t info) {
+  i::Handle<i::Object> i_val = Utils::OpenHandle(*val);
+  if (i_val->IsHeapObject()) {
+    i::Handle<i::HeapObject> as_heap = i::Handle<i::HeapObject>::cast(i_val);
+    i::Isolate* i_isolate =
+      reinterpret_cast<i::Isolate*>(as_heap->GetIsolate());
+    ENTER_V8(i_isolate);
+    tainttracking::SetTaintInfo(as_heap, info);
+  }
+}
+
+int64_t String::GetTaintInfo() const {
+  i::Handle<i::String> thisstr = Utils::OpenHandle(this);
+  ENTER_V8(thisstr->GetIsolate());
+  return thisstr->taint_info();
+}
+
+
+// static
+int64_t String::NewUniqueId(v8::Isolate* isolate) {
+  i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(isolate);
+  ENTER_V8(i_isolate);
+  int64_t* item = tainttracking::TaintTracker::FromIsolate(i_isolate)->
+    symbolic_elem_counter();
+  int64_t ret = (*item = *item + 1);
+  DCHECK_NE(ret, 0);
+  return ret;
+}
+
+int64_t String::LogIfTainted(TaintSinkLabel label, int symbolic_data) {
+  ENTER_V8(Utils::OpenHandle(this)->GetIsolate());
+  i::Handle<i::String> thisstr = Utils::OpenHandle(this);
+  return tainttracking::LogIfTainted(thisstr, label, symbolic_data);
+}
+
+// static
+void String::SetTaint(v8::Local<v8::Value> val,
+                      v8::Isolate* isolate,
+                      TaintType type) {
+  ENTER_V8(reinterpret_cast<i::Isolate*>(isolate));
+  i::Handle<i::Object> obj = Utils::OpenHandle(*val);
+  tainttracking::SetTaint(obj, type);
+}
+
+// static
+template <typename Char>
+int64_t String::LogIfBufferTainted(TaintData* buffer,
+                                   Char* stringdata,
+                                   size_t length,
+
+                                   int symbolic_data,
+                                   v8::Isolate* isolate,
+                                   TaintSinkLabel label) {
+  i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(isolate);
+  ENTER_V8(i_isolate);
+  return tainttracking::LogIfBufferTainted(
+      buffer, stringdata, length, symbolic_data, i_isolate, label);
+}
+
+#define DECLARE_LOG_IF_TAINTED(type)               \
+template int64_t String::LogIfBufferTainted<type>( \
+    TaintData* buffer,                             \
+    type* stringdata,                              \
+    size_t length,                                 \
+    int symbolic_data,                             \
+    v8::Isolate* isolate,                          \
+    TaintSinkLabel label);
+
+DECLARE_LOG_IF_TAINTED(uint8_t);
+DECLARE_LOG_IF_TAINTED(uint16_t);
+DECLARE_LOG_IF_TAINTED(const uint8_t);
+DECLARE_LOG_IF_TAINTED(const uint16_t);
+#undef DECLARE_LOG_IF_TAINTED
+
+// static
+void TaintTracking::LogInitializeNavigate(v8::Local<v8::String> url) {
+  i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(
+      Utils::OpenHandle(*url)->GetIsolate());
+  ENTER_V8(i_isolate);
+  return tainttracking::LogInitializeNavigate(Utils::OpenHandle(*url));
+}
+
+
 bool v8::String::IsExternal() const {
   i::Handle<i::String> str = Utils::OpenHandle(this);
   return i::StringShape(*str).IsExternalTwoByte();
@@ -5781,6 +5879,12 @@ void v8::Context::SetSecurityToken(Local<Value> token) {
   i::Handle<i::Context> env = Utils::OpenHandle(this);
   i::Handle<i::Object> token_handle = Utils::OpenHandle(*token);
   env->set_security_token(*token_handle);
+}
+
+void v8::Context::SetTaintTrackingContextId(Local<Value> token) {
+  i::Handle<i::Context> env = Utils::OpenHandle(this);
+  i::Handle<i::Object> token_handle = Utils::OpenHandle(*token);
+  env->set_taint_tracking_context_id(*token_handle);
 }
 
 
@@ -8990,6 +9094,7 @@ void InvokeFunctionCallback(const v8::FunctionCallbackInfo<v8::Value>& info,
       reinterpret_cast<Address>(reinterpret_cast<intptr_t>(callback));
   VMState<EXTERNAL> state(isolate);
   ExternalCallbackScope call_scope(isolate, callback_address);
+  DCHECK(tainttracking::SymbolicMatchesFunctionArgs(info));
   callback(info);
 }
 

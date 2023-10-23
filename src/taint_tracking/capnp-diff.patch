@@ -1,0 +1,27 @@
+From 09f11e014725a5a00c4474dcd9db1d1b714b1c75 Mon Sep 17 00:00:00 2001
+From: William Melicher <wrmelicher@gmail.com>
+Date: Wed, 14 Dec 2016 11:52:40 -0500
+Subject: [PATCH] Using std::chrono::monotonic_clock instead of steady_clock
+ because I am forced to use libc++ version 4.6.3 which does not have
+ steady_clock.
+
+---
+ c++/src/kj/async-unix.c++ | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/c++/src/kj/async-unix.c++ b/c++/src/kj/async-unix.c++
+index 42fd11d..2c652d0 100644
+--- a/c++/src/kj/async-unix.c++
++++ b/c++/src/kj/async-unix.c++
+@@ -47,7 +47,7 @@ namespace kj {
+ 
+ TimePoint UnixEventPort::readClock() {
+   return origin<TimePoint>() + std::chrono::duration_cast<std::chrono::nanoseconds>(
+-      std::chrono::steady_clock::now().time_since_epoch()).count() * NANOSECONDS;
++      std::chrono::monotonic_clock::now().time_since_epoch()).count() * NANOSECONDS;
+ }
+ 
+ // =======================================================================================
+-- 
+2.9.3
+

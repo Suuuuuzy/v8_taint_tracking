@@ -469,7 +469,8 @@ BytecodeArrayBuilder& BytecodeArrayBuilder::StackCheck(int position) {
     // is associated with these positions, instead we force the stack
     // check's expression position which eliminates the empty
     // statement's position.
-    latest_source_info_.ForceExpressionPosition(position);
+    latest_source_info_.ForceExpressionPosition(
+        position, SourcePositionTableBuilder::NO_TAINT_TRACKING_INDEX);
   }
   Output(Bytecode::kStackCheck);
   return *this;
@@ -662,12 +663,14 @@ void BytecodeArrayBuilder::InsertConstantPoolEntryAt(size_t entry,
 
 void BytecodeArrayBuilder::SetReturnPosition() {
   if (return_position_ == kNoSourcePosition) return;
-  latest_source_info_.MakeStatementPosition(return_position_);
+  latest_source_info_.MakeStatementPosition(
+      return_position_, SourcePositionTableBuilder::NO_TAINT_TRACKING_INDEX);
 }
 
 void BytecodeArrayBuilder::SetStatementPosition(Statement* stmt) {
   if (stmt->position() == kNoSourcePosition) return;
-  latest_source_info_.MakeStatementPosition(stmt->position());
+  latest_source_info_.MakeStatementPosition(
+      stmt->position(), SourcePositionTableBuilder::NO_TAINT_TRACKING_INDEX);
 }
 
 void BytecodeArrayBuilder::SetExpressionPosition(Expression* expr) {
@@ -675,13 +678,15 @@ void BytecodeArrayBuilder::SetExpressionPosition(Expression* expr) {
   if (!latest_source_info_.is_statement()) {
     // Ensure the current expression position is overwritten with the
     // latest value.
-    latest_source_info_.MakeExpressionPosition(expr->position());
+    latest_source_info_.MakeExpressionPosition(
+        expr->position(), SourcePositionTableBuilder::NO_TAINT_TRACKING_INDEX);
   }
 }
 
 void BytecodeArrayBuilder::SetExpressionAsStatementPosition(Expression* expr) {
   if (expr->position() == kNoSourcePosition) return;
-  latest_source_info_.MakeStatementPosition(expr->position());
+  latest_source_info_.MakeStatementPosition(
+      expr->position(), SourcePositionTableBuilder::NO_TAINT_TRACKING_INDEX);
 }
 
 bool BytecodeArrayBuilder::TemporaryRegisterIsLive(Register reg) const {

@@ -3893,7 +3893,8 @@ TEST(ContextDisposeDoesntClearPolymorphicIC) {
 }
 
 
-class SourceResource : public v8::String::ExternalOneByteStringResource {
+class SourceResource : public v8::String::ExternalOneByteStringResource,
+                         public v8::String::TaintTrackingStringBufferImpl {
  public:
   explicit SourceResource(const char* data)
     : data_(data), length_(strlen(data)) { }

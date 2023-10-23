@@ -2327,6 +2327,17 @@ EffectControlLinearizer::LowerStringFromCharCode(Node* node, Node* effect,
                                             kHeapObjectTag),
           code, etrue1, if_true1);
 
+      // Zero out the taint
+      etrue1 = graph()->NewNode(
+          machine()->Store(StoreRepresentation(MachineRepresentation::kWord8,
+                                               kNoWriteBarrier)),
+          vtrue1, jsgraph()->IntPtrConstant(SeqOneByteString::kHeaderSize -
+                                            kHeapObjectTag +
+                                            kCharSize),
+          jsgraph()->IntPtrConstant(0),
+          etrue1,
+          if_true1);
+
       // Remember it in the {cache}.
       etrue1 = graph()->NewNode(
           simplified()->StoreElement(AccessBuilder::ForFixedArrayElement()),
@@ -2369,6 +2380,16 @@ EffectControlLinearizer::LowerStringFromCharCode(Node* node, Node* effect,
         vfalse0, jsgraph()->IntPtrConstant(SeqTwoByteString::kHeaderSize -
                                            kHeapObjectTag),
         code, efalse0, if_false0);
+    // Zero-ing out the taint
+    efalse0 = graph()->NewNode(
+        machine()->Store(StoreRepresentation(MachineRepresentation::kWord8,
+                                             kNoWriteBarrier)),
+        vfalse0, jsgraph()->IntPtrConstant(SeqTwoByteString::kHeaderSize -
+                                           kHeapObjectTag +
+                                           kShortSize),
+        jsgraph()->IntPtrConstant(0),
+        efalse0,
+        if_false0);
   }
 
   control = graph()->NewNode(common()->Merge(2), if_true0, if_false0);

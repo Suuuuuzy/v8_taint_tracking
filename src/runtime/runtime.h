@@ -326,7 +326,26 @@ namespace internal {
   F(RunMicrotasks, 0, 1)                            \
   F(OrdinaryHasInstance, 2, 1)                      \
   F(IsWasmObject, 1, 1)                             \
-  F(Typeof, 1, 1)
+  F(Typeof, 1, 1)                                   \
+  F(TaintTrackingHook, 3, 1)                        \
+  F(TaintTrackingLoadVariable, 4, 1)                \
+  F(TaintTrackingStoreVariable, -1, 1)              \
+  F(TaintTrackingStoreContextVariable, 4, 1)        \
+  F(TaintTrackingExitStackFrame, 0, 1)              \
+  F(TaintTrackingPrepareFrame, 1, 1)                \
+  F(TaintTrackingEnterFrame, 0, 1)                  \
+  F(TaintTrackingAddArgumentToFrame, 1, 1)          \
+  F(TaintTrackingSetReturnValue, -1, 1)             \
+  F(TaintTrackingEnterTry, 1, 1)                    \
+  F(TaintTrackingExitTry, 1, 1)                     \
+  F(TaintTrackingExitFinally, 0, 1)                 \
+  F(TaintTrackingAddReceiver, 2, 1)                 \
+  F(TaintTrackingPrepareApply, 5, 1)                \
+  F(TaintTrackingPrepareCall, -1, 1)                \
+  F(TaintTrackingPrepareCallOrConstruct, -1, 1)     \
+  F(TaintTrackingAddLiteralReceiver, 1, 1)          \
+  F(TaintTrackingCheckMessageOrigin, 3, 1)          \
+  F(TaintTrackingParameterToContextStorage, 3, 1)
 
 #define FOR_EACH_INTRINSIC_LITERALS(F) \
   F(CreateRegExpLiteral, 4, 1)         \
@@ -403,7 +422,7 @@ namespace internal {
   F(DefineGetterPropertyUnchecked, 4, 1)             \
   F(DefineSetterPropertyUnchecked, 4, 1)             \
   F(ToObject, 1, 1)                                  \
-  F(ToPrimitive, 1, 1)                               \
+  F(ToPrimitive, -1, 1)                              \
   F(ToPrimitive_Number, 1, 1)                        \
   F(ToNumber, 1, 1)                                  \
   F(ToInteger, 1, 1)                                 \
@@ -482,8 +501,8 @@ namespace internal {
   F(DeleteLookupSlot, 1, 1)             \
   F(LoadLookupSlot, 1, 1)               \
   F(LoadLookupSlotInsideTypeof, 1, 1)   \
-  F(StoreLookupSlot_Sloppy, 2, 1)       \
-  F(StoreLookupSlot_Strict, 2, 1)
+  F(StoreLookupSlot_Sloppy, -1, 1)       \
+  F(StoreLookupSlot_Strict, -1, 1)
 
 #define FOR_EACH_INTRINSIC_SIMD(F)     \
   F(IsSimdValue, 1, 1)                 \

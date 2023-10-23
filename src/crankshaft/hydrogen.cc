@@ -2504,6 +2504,9 @@ HValue* HGraphBuilder::BuildCreateConsString(
   Add<HStoreNamedField>(result, HObjectAccess::ForStringLength(), length);
   Add<HStoreNamedField>(result, HObjectAccess::ForConsStringFirst(), left);
   Add<HStoreNamedField>(result, HObjectAccess::ForConsStringSecond(), right);
+  // Initializes taint_info
+  Add<HStoreNamedField>(result, HObjectAccess::ForStringTaintInfo(),
+                        graph()->GetConstant0());
 
   // Count the native string addition.
   AddIncrementCounter(isolate()->counters()->string_add_native());
@@ -2552,6 +2555,8 @@ HValue* HGraphBuilder::BuildUncheckedStringAdd(
     HValue* right,
     HAllocationMode allocation_mode) {
   // Determine the string lengths.
+  // Fallback to the runtime to add the two strings.
+
   HValue* left_length = AddLoadStringLength(left);
   HValue* right_length = AddLoadStringLength(right);
 
@@ -2629,15 +2634,23 @@ HValue* HGraphBuilder::BuildUncheckedStringAdd(
       if_onebyte.Then();
       {
         // Allocate sequential one-byte string object.
-        Push(length);
+        // For tainted objects, need more space
+        // This should match SeqOneByteString::SizeFor(length)
+        HValue* size = AddUncasted<HShl>(length, graph()->GetConstant1());
+        size->ClearFlag(HValue::kCanOverflow);
+        size->SetFlag(HValue::kUint32);
+        Push(size);
         Push(one_byte_string_map);
       }
       if_onebyte.Else();
       {
         // Allocate sequential two-byte string object.
+        // This should match SeqOneByteString::SizeFor(length)
+        // Need to add length twice for taint
         HValue* size = AddUncasted<HShl>(length, graph()->GetConstant1());
         size->ClearFlag(HValue::kCanOverflow);
         size->SetFlag(HValue::kUint32);
+        size = AddUncasted<HAdd>(size, length);
         Push(size);
         Push(string_map);
       }
@@ -2664,6 +2677,9 @@ HValue* HGraphBuilder::BuildUncheckedStringAdd(
         Add<HStoreNamedField>(result, HObjectAccess::ForStringHashField(),
                               Add<HConstant>(String::kEmptyHashField));
         Add<HStoreNamedField>(result, HObjectAccess::ForStringLength(), length);
+        // Initializes taint_info
+        Add<HStoreNamedField>(result, HObjectAccess::ForStringTaintInfo(),
+                              graph()->GetConstant0());
 
         // Copy characters to the result string.
         IfBuilder if_twobyte(this);
@@ -2675,10 +2691,33 @@ HValue* HGraphBuilder::BuildUncheckedStringAdd(
               left, graph()->GetConstant0(), String::TWO_BYTE_ENCODING, result,
               graph()->GetConstant0(), String::TWO_BYTE_ENCODING, left_length);
 
+          // Copy taint characters from the left string
+          BuildCopySeqStringChars(
+              left,
+              AddUncasted<HShl>(left_length, graph()->GetConstant1()),
+              String::ONE_BYTE_ENCODING,
+              result,
+              AddUncasted<HShl>(length, graph()->GetConstant1()),
+              String::ONE_BYTE_ENCODING,
+              left_length);
+
           // Copy characters from the right string.
           BuildCopySeqStringChars(
               right, graph()->GetConstant0(), String::TWO_BYTE_ENCODING, result,
               left_length, String::TWO_BYTE_ENCODING, right_length);
+
+          // Copy taint characters from the left string
+          BuildCopySeqStringChars(
+              right,
+              AddUncasted<HShl>(right_length, graph()->GetConstant1()),
+              String::ONE_BYTE_ENCODING,
+              result,
+              AddUncasted<HAdd>(
+                  AddUncasted<HShl>(length, graph()->GetConstant1()),
+                  left_length),
+              String::ONE_BYTE_ENCODING,
+              right_length);
+
         }
         if_twobyte.Else();
         {
@@ -2687,10 +2726,31 @@ HValue* HGraphBuilder::BuildUncheckedStringAdd(
               left, graph()->GetConstant0(), String::ONE_BYTE_ENCODING, result,
               graph()->GetConstant0(), String::ONE_BYTE_ENCODING, left_length);
 
+          // Copy taint characters from the left string
+          BuildCopySeqStringChars(
+              left,
+              left_length,
+              String::ONE_BYTE_ENCODING,
+              result,
+              length,
+              String::ONE_BYTE_ENCODING,
+              left_length);
+
           // Copy characters from the right string.
           BuildCopySeqStringChars(
               right, graph()->GetConstant0(), String::ONE_BYTE_ENCODING, result,
               left_length, String::ONE_BYTE_ENCODING, right_length);
+
+          // Copy taint characters from the left string
+          BuildCopySeqStringChars(
+              right,
+              right_length,
+              String::ONE_BYTE_ENCODING,
+              result,
+              AddUncasted<HAdd>(length, left_length),
+              String::ONE_BYTE_ENCODING,
+              right_length);
+
         }
         if_twobyte.End();
 
@@ -2727,6 +2787,7 @@ HValue* HGraphBuilder::BuildStringAdd(
     HValue* left,
     HValue* right,
     HAllocationMode allocation_mode) {
+
   NoObservableSideEffectsScope no_effects(this);
 
   // Determine string lengths.
@@ -3513,7 +3574,8 @@ HOptimizedGraphBuilder::HOptimizedGraphBuilder(CompilationInfo* info)
       inlined_count_(0),
       globals_(10, info->zone()),
       osr_(new (info->zone()) HOsrBuilder(this)),
-      bounds_(info->zone()) {
+      bounds_(info->zone()),
+      node_label_serializer_(info->isolate()) {
   // This is not initialized in the initializer list because the
   // constructor for the initial state relies on function_state_ == NULL
   // to know it's the initial state.
@@ -5518,6 +5580,7 @@ void HOptimizedGraphBuilder::VisitFunctionLiteral(FunctionLiteral* expr) {
         expr->pretenure() ? Runtime::kNewClosure_Tenured : Runtime::kNewClosure;
     instr = New<HCallRuntime>(Runtime::FunctionForId(function_id), 1);
   }
+  GenerateTaintTrackingHook(instr, expr);
   return ast_context()->ReturnInstruction(instr, expr->id());
 }
 
@@ -5545,7 +5608,14 @@ void HOptimizedGraphBuilder::VisitDoExpression(DoExpression* expr) {
   DCHECK(current_block() != NULL);
   DCHECK(current_block()->HasPredecessor());
   CHECK_ALIVE(VisitBlock(expr->block()));
-  Visit(expr->result());
+  HValue* ret;
+  {
+    ValueContext value(this, ARGUMENTS_NOT_ALLOWED);
+    Visit(expr->result());
+    ret = Pop();
+    GenerateTaintTrackingHook(ret, expr);
+  }
+  ast_context()->ReturnValue(ret);
 }
 
 
@@ -5581,7 +5651,9 @@ void HOptimizedGraphBuilder::VisitConditional(Conditional* expr) {
     HBasicBlock* join = CreateJoin(cond_true, cond_false, expr->id());
     set_current_block(join);
     if (join != NULL && !ast_context()->IsEffect()) {
-      return ast_context()->ReturnValue(Pop());
+      HValue* value = Pop();
+      GenerateTaintTrackingHook(value, expr);
+      return ast_context()->ReturnValue(value);
     }
   }
 }
@@ -5645,6 +5717,7 @@ void HOptimizedGraphBuilder::VisitVariableProxy(VariableProxy* expr) {
           isolate()->factory()->GlobalConstantFor(variable->name());
       if (!constant_value.is_null()) {
         HConstant* instr = New<HConstant>(constant_value);
+        GenerateTaintTrackingHook(instr, expr);
         return ast_context()->ReturnInstruction(instr, expr->id());
       }
 
@@ -5670,6 +5743,7 @@ void HOptimizedGraphBuilder::VisitVariableProxy(VariableProxy* expr) {
           HInstruction* result = New<HLoadNamedField>(
               Add<HConstant>(script_context), nullptr,
               HObjectAccess::ForContextSlot(lookup.slot_index));
+          GenerateTaintTrackingHook(result, expr);
           return ast_context()->ReturnInstruction(result, expr->id());
         }
       }
@@ -5689,6 +5763,7 @@ void HOptimizedGraphBuilder::VisitVariableProxy(VariableProxy* expr) {
                 String::Flatten(Handle<String>::cast(constant_object));
           }
           HConstant* constant = New<HConstant>(constant_object);
+          GenerateTaintTrackingHook(constant, expr);
           return ast_context()->ReturnInstruction(constant, expr->id());
         } else {
           auto access = HObjectAccess::ForPropertyCellValue();
@@ -5724,6 +5799,7 @@ void HOptimizedGraphBuilder::VisitVariableProxy(VariableProxy* expr) {
           }
           instr->ClearDependsOnFlag(kInobjectFields);
           instr->SetDependsOnFlag(kGlobalVars);
+          GenerateTaintTrackingHook(instr, expr);
           return ast_context()->ReturnInstruction(instr, expr->id());
         }
       } else {
@@ -5731,6 +5807,7 @@ void HOptimizedGraphBuilder::VisitVariableProxy(VariableProxy* expr) {
         HLoadGlobalGeneric* instr = New<HLoadGlobalGeneric>(
             variable->name(), ast_context()->typeof_mode(), vector,
             expr->VariableFeedbackSlot());
+        GenerateTaintTrackingHook(instr, expr);
         return ast_context()->ReturnInstruction(instr, expr->id());
       }
     }
@@ -5743,6 +5820,7 @@ void HOptimizedGraphBuilder::VisitVariableProxy(VariableProxy* expr) {
                variable->mode() != VAR);
         return Bailout(kReferenceToUninitializedVariable);
       }
+      GenerateTaintTrackingHook(value, expr);
       return ast_context()->ReturnValue(value);
     }
 
@@ -5760,6 +5838,7 @@ void HOptimizedGraphBuilder::VisitVariableProxy(VariableProxy* expr) {
       }
       HLoadContextSlot* instr =
           new(zone()) HLoadContextSlot(context, variable->index(), mode);
+      GenerateTaintTrackingHook(instr, expr);
       return ast_context()->ReturnInstruction(instr, expr->id());
     }
 
@@ -5774,6 +5853,7 @@ void HOptimizedGraphBuilder::VisitLiteral(Literal* expr) {
   DCHECK(current_block() != NULL);
   DCHECK(current_block()->HasPredecessor());
   HConstant* instr = New<HConstant>(expr->value());
+  GenerateTaintTrackingHook(instr, expr);
   return ast_context()->ReturnInstruction(instr, expr->id());
 }
 
@@ -5789,6 +5869,7 @@ void HOptimizedGraphBuilder::VisitRegExpLiteral(RegExpLiteral* expr) {
   HConstant* stub_value = Add<HConstant>(callable.code());
   HInstruction* instr = New<HCallWithDescriptor>(
       stub_value, 0, callable.descriptor(), ArrayVector(values));
+  GenerateTaintTrackingHook(instr, expr);
   return ast_context()->ReturnInstruction(instr, expr->id());
 }
 
@@ -5984,7 +6065,9 @@ void HOptimizedGraphBuilder::VisitObjectLiteral(ObjectLiteral* expr) {
     }
   }
 
-  return ast_context()->ReturnValue(Pop());
+  HValue* value = Pop();
+  GenerateTaintTrackingHook(value, expr);
+  return ast_context()->ReturnValue(value);
 }
 
 
@@ -6086,7 +6169,9 @@ void HOptimizedGraphBuilder::VisitArrayLiteral(ArrayLiteral* expr) {
     Add<HSimulate>(expr->GetIdForElement(i));
   }
 
-  return ast_context()->ReturnValue(Pop());
+  HValue* value = Pop();
+  GenerateTaintTrackingHook(value, expr);
+  return ast_context()->ReturnValue(value);
 }
 
 
@@ -6764,7 +6849,8 @@ static bool AreStringTypes(SmallMapList* maps) {
 void HOptimizedGraphBuilder::BuildStore(Expression* expr, Property* prop,
                                         FeedbackVectorSlot slot,
                                         BailoutId ast_id, BailoutId return_id,
-                                        bool is_uninitialized) {
+                                        bool is_uninitialized,
+                                        tainttracking::ValueState hook_state) {
   if (!prop->key()->IsPropertyName()) {
     // Keyed store.
     HValue* value = Pop();
@@ -6779,7 +6865,16 @@ void HOptimizedGraphBuilder::BuildStore(Expression* expr, Property* prop,
       Add<HSimulate>(ast_id, REMOVABLE_SIMULATE);
       if (!ast_context()->IsEffect()) Drop(1);
     }
-    if (result == NULL) return;
+    if (result == NULL) {
+      if (hook_state == tainttracking::ValueState::ADD_HOOK) {
+        GenerateTaintTrackingHook(
+          tainttracking::ValueState::OPTIMIZED_OUT, expr);
+      }
+      return;
+    }
+    if (hook_state == tainttracking::ValueState::ADD_HOOK) {
+      GenerateTaintTrackingHook(value, expr);
+    }
     return ast_context()->ReturnValue(value);
   }
 
@@ -6793,7 +6888,13 @@ void HOptimizedGraphBuilder::BuildStore(Expression* expr, Property* prop,
 
   HValue* access = BuildNamedAccess(STORE, ast_id, return_id, expr, slot,
                                     object, name, value, is_uninitialized);
-  if (access == NULL) return;
+  if (access == NULL) {
+    if (hook_state == tainttracking::ValueState::ADD_HOOK) {
+      GenerateTaintTrackingHook(
+          tainttracking::ValueState::OPTIMIZED_OUT, expr);
+    }
+    return;
+  }
 
   if (!ast_context()->IsEffect()) Push(value);
   if (access->IsInstruction()) AddInstruction(HInstruction::cast(access));
@@ -6801,6 +6902,9 @@ void HOptimizedGraphBuilder::BuildStore(Expression* expr, Property* prop,
     Add<HSimulate>(ast_id, REMOVABLE_SIMULATE);
   }
   if (!ast_context()->IsEffect()) Drop(1);
+  if (hook_state == tainttracking::ValueState::ADD_HOOK) {
+    GenerateTaintTrackingHook(value, expr);
+  }
   return ast_context()->ReturnValue(value);
 }
 
@@ -6814,7 +6918,8 @@ void HOptimizedGraphBuilder::HandlePropertyAssignment(Assignment* expr) {
   }
   CHECK_ALIVE(VisitForValue(expr->value()));
   BuildStore(expr, prop, expr->AssignmentSlot(), expr->id(),
-             expr->AssignmentId(), expr->IsUninitialized());
+             expr->AssignmentId(), expr->IsUninitialized(),
+             tainttracking::ValueState::ADD_HOOK);
 }
 
 
@@ -7045,7 +7150,13 @@ void HOptimizedGraphBuilder::VisitAssignment(Assignment* expr) {
   DCHECK(proxy == NULL || prop == NULL);
 
   if (expr->is_compound()) {
-    HandleCompoundAssignment(expr);
+    {
+      ValueContext ctx (this, ARGUMENTS_NOT_ALLOWED);
+      HandleCompoundAssignment(expr);
+    }
+    HValue* value = Pop();
+    GenerateTaintTrackingHook(value, expr);
+    ast_context()->ReturnValue(value);
     return;
   }
 
@@ -7064,7 +7175,9 @@ void HOptimizedGraphBuilder::VisitAssignment(Assignment* expr) {
           return Bailout(kNonInitializerAssignmentToConst);
         } else {
           CHECK_ALIVE(VisitForValue(expr->value()));
-          return ast_context()->ReturnValue(Pop());
+          HValue* value = Pop();
+          GenerateTaintTrackingHook(value, expr);
+          return ast_context()->ReturnValue(value);
         }
       }
 
@@ -7080,6 +7193,7 @@ void HOptimizedGraphBuilder::VisitAssignment(Assignment* expr) {
 
     if (proxy->IsArguments()) return Bailout(kAssignmentToArguments);
 
+    HValue* taint_val;
     // Handle the assignment.
     switch (var->location()) {
       case VariableLocation::GLOBAL:
@@ -7087,7 +7201,9 @@ void HOptimizedGraphBuilder::VisitAssignment(Assignment* expr) {
         CHECK_ALIVE(VisitForValue(expr->value()));
         HandleGlobalVariableAssignment(var, Top(), expr->AssignmentSlot(),
                                        expr->AssignmentId());
-        return ast_context()->ReturnValue(Pop());
+        taint_val = Pop();
+        GenerateTaintTrackingHook(taint_val, expr);
+        return ast_context()->ReturnValue(taint_val);
 
       case VariableLocation::PARAMETER:
       case VariableLocation::LOCAL: {
@@ -7105,6 +7221,7 @@ void HOptimizedGraphBuilder::VisitAssignment(Assignment* expr) {
         CHECK_ALIVE(VisitForValue(expr->value(), ARGUMENTS_ALLOWED));
         HValue* value = Pop();
         BindIfLive(var, value);
+        GenerateTaintTrackingHook(value, expr);
         return ast_context()->ReturnValue(value);
       }
 
@@ -7125,6 +7242,7 @@ void HOptimizedGraphBuilder::VisitAssignment(Assignment* expr) {
 
         CHECK_ALIVE(VisitForValue(expr->value()));
         HStoreContextSlot::Mode mode;
+        HValue* taint_value;
         if (expr->op() == Token::ASSIGN) {
           switch (var->mode()) {
             case LET:
@@ -7135,7 +7253,9 @@ void HOptimizedGraphBuilder::VisitAssignment(Assignment* expr) {
               // perform checks here
               UNREACHABLE();
             case CONST_LEGACY:
-              return ast_context()->ReturnValue(Pop());
+              taint_value = Pop();
+              GenerateTaintTrackingHook(taint_value, expr);
+              return ast_context()->ReturnValue(taint_value);
             default:
               mode = HStoreContextSlot::kNoCheck;
           }
@@ -7150,7 +7270,9 @@ void HOptimizedGraphBuilder::VisitAssignment(Assignment* expr) {
         if (instr->HasObservableSideEffects()) {
           Add<HSimulate>(expr->AssignmentId(), REMOVABLE_SIMULATE);
         }
-        return ast_context()->ReturnValue(Pop());
+        taint_val = Pop();
+        GenerateTaintTrackingHook(taint_val, expr);
+        return ast_context()->ReturnValue(taint_val);
       }
 
       case VariableLocation::LOOKUP:
@@ -7803,6 +7925,7 @@ bool HOptimizedGraphBuilder::TryArgumentsAccess(Property* expr) {
       result = New<HAccessArgumentsAt>(elements, length, checked_key);
     }
   }
+  GenerateTaintTrackingHook(result, expr);
   ast_context()->ReturnInstruction(result, expr->id());
   return true;
 }
@@ -7870,9 +7993,15 @@ void HOptimizedGraphBuilder::BuildLoad(Property* expr,
                                      expr->PropertyFeedbackSlot(), object, name,
                                      NULL, expr->IsUninitialized());
     if (value == NULL) return;
-    if (value->IsPhi()) return ast_context()->ReturnValue(value);
+    if (value->IsPhi()) {
+      GenerateTaintTrackingHook(value, expr);
+      return ast_context()->ReturnValue(value);
+    }
     instr = HInstruction::cast(value);
-    if (instr->IsLinked()) return ast_context()->ReturnValue(instr);
+    if (instr->IsLinked()) {
+      GenerateTaintTrackingHook(instr, expr);
+      return ast_context()->ReturnValue(instr);
+    }
 
   } else {
     HValue* key = Pop();
@@ -7891,9 +8020,15 @@ void HOptimizedGraphBuilder::BuildLoad(Property* expr,
         Drop(1);
       }
     }
-    if (load == NULL) return;
+    if (load == NULL) {
+      GenerateTaintTrackingHook(
+          tainttracking::ValueState::OPTIMIZED_OUT, expr);
+      return;
+    }
+    GenerateTaintTrackingHook(load, expr);
     return ast_context()->ReturnValue(load);
   }
+  GenerateTaintTrackingHook(instr, expr);
   return ast_context()->ReturnInstruction(instr, ast_id);
 }
 
@@ -8218,7 +8353,9 @@ void HOptimizedGraphBuilder::HandlePolymorphicCallNamed(Call* expr,
       if (!ast_context()->IsEffect()) Push(call);
       Goto(join);
     } else {
-      return ast_context()->ReturnInstruction(call, expr->id());
+      GenerateTaintTrackingHook(call, expr);
+      ast_context()->ReturnInstruction(call, expr->id());
+      return;
     }
   }
 
@@ -8229,9 +8366,17 @@ void HOptimizedGraphBuilder::HandlePolymorphicCallNamed(Call* expr,
   if (join->HasPredecessor()) {
     set_current_block(join);
     join->SetJoinId(expr->id());
-    if (!ast_context()->IsEffect()) return ast_context()->ReturnValue(Pop());
+    if (!ast_context()->IsEffect()) {
+      HValue* val = Pop();
+      GenerateTaintTrackingHook(val, expr);
+      return ast_context()->ReturnValue(val);
+    } else {
+      GenerateTaintTrackingHook(
+          tainttracking::ValueState::OPTIMIZED_OUT, expr);
+    }
   } else {
     set_current_block(NULL);
+    GenerateTaintTrackingHook(tainttracking::ValueState::OPTIMIZED_OUT, expr);
   }
 }
 
@@ -8309,7 +8454,8 @@ bool HOptimizedGraphBuilder::TryInline(Handle<JSFunction> target,
                                        HValue* implicit_return_value,
                                        BailoutId ast_id, BailoutId return_id,
                                        InliningKind inlining_kind,
-                                       TailCallMode syntactic_tail_call_mode) {
+                                       TailCallMode syntactic_tail_call_mode,
+                                       Expression* taint_hook) {
   if (target->context()->native_context() !=
       top_info()->closure()->context()->native_context()) {
     return false;
@@ -8606,12 +8752,18 @@ bool HOptimizedGraphBuilder::TryInline(Handle<JSFunction> target,
       entry->RegisterReturnTarget(if_true, zone());
       if_true->SetJoinId(ast_id);
       HBasicBlock* true_target = TestContext::cast(ast_context())->if_true();
+      if (taint_hook) {
+        GenerateTaintTrackingHookConst(true, taint_hook);
+      }
       Goto(if_true, true_target, function_state());
     }
     if (if_false->HasPredecessor()) {
       entry->RegisterReturnTarget(if_false, zone());
       if_false->SetJoinId(ast_id);
       HBasicBlock* false_target = TestContext::cast(ast_context())->if_false();
+      if (taint_hook) {
+        GenerateTaintTrackingHookConst(false, taint_hook);
+      }
       Goto(if_false, false_target, function_state());
     }
     set_current_block(NULL);
@@ -8630,17 +8782,19 @@ bool HOptimizedGraphBuilder::TryInline(Handle<JSFunction> target,
 
 
 bool HOptimizedGraphBuilder::TryInlineCall(Call* expr) {
-  return TryInline(expr->target(), expr->arguments()->length(), NULL,
-                   expr->id(), expr->ReturnId(), NORMAL_RETURN,
-                   expr->tail_call_mode());
+  return TryInline(
+      expr->target(), expr->arguments()->length(), NULL,
+      expr->id(), expr->ReturnId(), NORMAL_RETURN,
+      expr->tail_call_mode(), expr);
 }
 
 
 bool HOptimizedGraphBuilder::TryInlineConstruct(CallNew* expr,
                                                 HValue* implicit_return_value) {
-  return TryInline(expr->target(), expr->arguments()->length(),
-                   implicit_return_value, expr->id(), expr->ReturnId(),
-                   CONSTRUCT_CALL_RETURN, TailCallMode::kDisallow);
+  return TryInline(
+      expr->target(), expr->arguments()->length(),
+      implicit_return_value, expr->id(), expr->ReturnId(),
+      CONSTRUCT_CALL_RETURN, TailCallMode::kDisallow, expr);
 }
 
 bool HOptimizedGraphBuilder::TryInlineGetter(Handle<Object> getter,
@@ -8698,6 +8852,7 @@ bool HOptimizedGraphBuilder::TryInlineBuiltinFunctionCall(Call* expr) {
         HValue* argument = Pop();
         Drop(2);  // Receiver and function.
         HInstruction* op = NewUncasted<HUnaryMathOperation>(argument, id);
+        GenerateTaintTrackingHook(op, expr);
         ast_context()->ReturnInstruction(op, expr->id());
         return true;
       }
@@ -8709,6 +8864,7 @@ bool HOptimizedGraphBuilder::TryInlineBuiltinFunctionCall(Call* expr) {
         Drop(2);  // Receiver and function.
         HInstruction* op =
             HMul::NewImul(isolate(), zone(), context(), left, right);
+        GenerateTaintTrackingHook(op, expr);
         ast_context()->ReturnInstruction(op, expr->id());
         return true;
       }
@@ -8802,7 +8958,7 @@ bool HOptimizedGraphBuilder::TryInlineBuiltinGetterCall(
 
 bool HOptimizedGraphBuilder::TryInlineBuiltinMethodCall(
     Handle<JSFunction> function, Handle<Map> receiver_map, BailoutId ast_id,
-    int args_count_no_receiver) {
+    int args_count_no_receiver, Expression* taint_hook) {
   if (!function->shared()->HasBuiltinFunctionId()) return false;
   BuiltinFunctionId id = function->shared()->builtin_function_id();
   int argument_count = args_count_no_receiver + 1;  // Plus receiver.
@@ -8834,6 +8990,9 @@ bool HOptimizedGraphBuilder::TryInlineBuiltinMethodCall(
       if (cache->enumerable() != receiver->OperandAt(0)) return false;
       Drop(3);  // key, receiver, function
       Add<HCheckMapValue>(receiver, cache->map());
+      if (taint_hook != nullptr) {
+        GenerateTaintTrackingHookConst(true, taint_hook);
+      }
       ast_context()->ReturnValue(graph()->GetConstantTrue());
       return true;
     }
@@ -8851,6 +9010,9 @@ bool HOptimizedGraphBuilder::TryInlineBuiltinMethodCall(
         }
         AddInstruction(char_code);
         HInstruction* result = NewUncasted<HStringCharFromCode>(char_code);
+        if (taint_hook != nullptr) {
+          GenerateTaintTrackingHook(result, taint_hook);
+        }
         ast_context()->ReturnInstruction(result, ast_id);
         return true;
       }
@@ -8863,6 +9025,9 @@ bool HOptimizedGraphBuilder::TryInlineBuiltinMethodCall(
             argument, Representation::Integer32());
         argument->SetFlag(HValue::kTruncatingToInt32);
         HInstruction* result = NewUncasted<HStringCharFromCode>(argument);
+        if (taint_hook != nullptr) {
+          GenerateTaintTrackingHook(result, taint_hook);
+        }
         ast_context()->ReturnInstruction(result, ast_id);
         return true;
       }
@@ -8881,6 +9046,9 @@ bool HOptimizedGraphBuilder::TryInlineBuiltinMethodCall(
         HValue* argument = Pop();
         Drop(2);  // Receiver and function.
         HInstruction* op = NewUncasted<HUnaryMathOperation>(argument, id);
+        if (taint_hook != nullptr) {
+          GenerateTaintTrackingHook(op, taint_hook);
+        }
         ast_context()->ReturnInstruction(op, ast_id);
         return true;
       }
@@ -8912,6 +9080,9 @@ bool HOptimizedGraphBuilder::TryInlineBuiltinMethodCall(
         if (result == NULL) {
           result = NewUncasted<HPower>(left, right);
         }
+        if (taint_hook != nullptr) {
+          GenerateTaintTrackingHook(result, taint_hook);
+        }
         ast_context()->ReturnInstruction(result, ast_id);
         return true;
       }
@@ -8925,6 +9096,9 @@ bool HOptimizedGraphBuilder::TryInlineBuiltinMethodCall(
         HMathMinMax::Operation op = (id == kMathMin) ? HMathMinMax::kMathMin
                                                      : HMathMinMax::kMathMax;
         HInstruction* result = NewUncasted<HMathMinMax>(left, right, op);
+        if (taint_hook != nullptr) {
+          GenerateTaintTrackingHook(result, taint_hook);
+        }
         ast_context()->ReturnInstruction(result, ast_id);
         return true;
       }
@@ -8936,6 +9110,9 @@ bool HOptimizedGraphBuilder::TryInlineBuiltinMethodCall(
         Drop(2);  // Receiver and function.
         HInstruction* result =
             HMul::NewImul(isolate(), zone(), context(), left, right);
+        if (taint_hook != nullptr) {
+          GenerateTaintTrackingHook(result, taint_hook);
+        }
         ast_context()->ReturnInstruction(result, ast_id);
         return true;
       }
@@ -8995,6 +9172,9 @@ bool HOptimizedGraphBuilder::TryInlineBuiltinMethodCall(
       Add<HSimulate>(ast_id, REMOVABLE_SIMULATE);
       if (!ast_context()->IsEffect()) Drop(1);
 
+      if (taint_hook != nullptr) {
+        GenerateTaintTrackingHook(result, taint_hook);
+      }
       ast_context()->ReturnValue(result);
       return true;
     }
@@ -9048,7 +9228,9 @@ bool HOptimizedGraphBuilder::TryInlineBuiltinMethodCall(
         Add<HSimulate>(ast_id, REMOVABLE_SIMULATE);
         if (!ast_context()->IsEffect()) Drop(1);
       }
-
+      if (taint_hook != nullptr) {
+        GenerateTaintTrackingHook(new_size, taint_hook);
+      }
       ast_context()->ReturnValue(new_size);
       return true;
     }
@@ -9161,6 +9343,9 @@ bool HOptimizedGraphBuilder::TryInlineBuiltinMethodCall(
       result = ast_context()->IsEffect() ? graph()->GetConstant0() : Top();
       Add<HSimulate>(ast_id, REMOVABLE_SIMULATE);
       if (!ast_context()->IsEffect()) Drop(1);
+      if (taint_hook != nullptr) {
+        GenerateTaintTrackingHook(result, taint_hook);
+      }
       ast_context()->ReturnValue(result);
       return true;
     }
@@ -9198,6 +9383,9 @@ bool HOptimizedGraphBuilder::TryInlineBuiltinMethodCall(
       if (!ast_context()->IsEffect()) Push(index);
       Add<HSimulate>(ast_id, REMOVABLE_SIMULATE);
       if (!ast_context()->IsEffect()) Drop(1);
+      if (taint_hook != nullptr) {
+        GenerateTaintTrackingHook(index, taint_hook);
+      }
       ast_context()->ReturnValue(index);
       return true;
     }
@@ -9214,8 +9402,9 @@ bool HOptimizedGraphBuilder::TryInlineApiFunctionCall(Call* expr,
   Handle<JSFunction> function = expr->target();
   int argc = expr->arguments()->length();
   SmallMapList receiver_maps;
-  return TryInlineApiCall(function, receiver, &receiver_maps, argc, expr->id(),
-                          kCallApiFunction, expr->tail_call_mode());
+  return TryInlineApiCall(
+      function, receiver, &receiver_maps, argc, expr->id(),
+      kCallApiFunction, expr->tail_call_mode(), expr);
 }
 
 
@@ -9225,8 +9414,9 @@ bool HOptimizedGraphBuilder::TryInlineApiMethodCall(
     SmallMapList* receiver_maps) {
   Handle<JSFunction> function = expr->target();
   int argc = expr->arguments()->length();
-  return TryInlineApiCall(function, receiver, receiver_maps, argc, expr->id(),
-                          kCallApiMethod, expr->tail_call_mode());
+  return TryInlineApiCall(
+      function, receiver, receiver_maps, argc, expr->id(),
+      kCallApiMethod, expr->tail_call_mode(), expr);
 }
 
 bool HOptimizedGraphBuilder::TryInlineApiGetter(Handle<Object> function,
@@ -9254,7 +9444,8 @@ bool HOptimizedGraphBuilder::TryInlineApiSetter(Handle<Object> function,
 bool HOptimizedGraphBuilder::TryInlineApiCall(
     Handle<Object> function, HValue* receiver, SmallMapList* receiver_maps,
     int argc, BailoutId ast_id, ApiCallType call_type,
-    TailCallMode syntactic_tail_call_mode) {
+    TailCallMode syntactic_tail_call_mode,
+    Expression* taint_hook) {
   if (function->IsJSFunction() &&
       Handle<JSFunction>::cast(function)->context()->native_context() !=
           top_info()->closure()->context()->native_context()) {
@@ -9380,6 +9571,9 @@ bool HOptimizedGraphBuilder::TryInlineApiCall(
     Drop(1);  // Drop function.
   }
 
+  if (taint_hook != nullptr) {
+    GenerateTaintTrackingHook(call, taint_hook);
+  }
   ast_context()->ReturnInstruction(call, ast_id);
   return true;
 }
@@ -9697,6 +9891,8 @@ bool HOptimizedGraphBuilder::TryHandleArrayCall(T* expr, HValue* function) {
   HInstruction* call = PreProcessCall(New<HCallNewArray>(
       function, arguments_count + 1, site->GetElementsKind(), site));
   if (expr->IsCall()) Drop(1);
+
+  GenerateTaintTrackingHook(call, expr);
   ast_context()->ReturnInstruction(call, expr->id());
 
   return true;
@@ -9881,6 +10077,8 @@ void HOptimizedGraphBuilder::VisitCall(Call* expr) {
   }
 
   Drop(1);  // Drop the function.
+
+  GenerateTaintTrackingHook(call, expr);
   return ast_context()->ReturnInstruction(call, expr->id());
 }
 
@@ -10101,6 +10299,7 @@ void HOptimizedGraphBuilder::VisitCallNew(CallNew* expr) {
   PushArgumentsFromEnvironment(argument_count);
   HInstruction* construct = New<HCallWithDescriptor>(
       stub, argument_count, callable.descriptor(), ArrayVector(op_vals));
+  GenerateTaintTrackingHook(construct, expr);
   return ast_context()->ReturnInstruction(construct, expr->id());
 }
 
@@ -10441,6 +10640,7 @@ void HOptimizedGraphBuilder::GenerateTypedArrayInitialize(
 void HOptimizedGraphBuilder::GenerateMaxSmi(CallRuntime* expr) {
   DCHECK(expr->arguments()->length() == 0);
   HConstant* max_smi = New<HConstant>(static_cast<int32_t>(Smi::kMaxValue));
+  GenerateTaintTrackingHook(max_smi, expr);
   return ast_context()->ReturnInstruction(max_smi, expr->id());
 }
 
@@ -10450,6 +10650,7 @@ void HOptimizedGraphBuilder::GenerateTypedArrayMaxSizeInHeap(
   DCHECK(expr->arguments()->length() == 0);
   HConstant* result = New<HConstant>(static_cast<int32_t>(
         FLAG_typed_array_max_size_in_heap));
+  GenerateTaintTrackingHook(result, expr);
   return ast_context()->ReturnInstruction(result, expr->id());
 }
 
@@ -10461,6 +10662,7 @@ void HOptimizedGraphBuilder::GenerateArrayBufferGetByteLength(
   HValue* buffer = Pop();
   HInstruction* result = New<HLoadNamedField>(
       buffer, nullptr, HObjectAccess::ForJSArrayBufferByteLength());
+  GenerateTaintTrackingHook(result, expr);
   return ast_context()->ReturnInstruction(result, expr->id());
 }
 
@@ -10472,9 +10674,11 @@ void HOptimizedGraphBuilder::GenerateArrayBufferViewGetByteLength(
   CHECK_ALIVE(VisitForValue(expr->arguments()->at(0)));
   HValue* view = Pop();
 
-  return ast_context()->ReturnValue(BuildArrayBufferViewFieldAccessor(
+  HValue* ret = BuildArrayBufferViewFieldAccessor(
       view, nullptr,
-      FieldIndex::ForInObjectOffset(JSArrayBufferView::kByteLengthOffset)));
+      FieldIndex::ForInObjectOffset(JSArrayBufferView::kByteLengthOffset));
+  GenerateTaintTrackingHook(ret, expr);
+  return ast_context()->ReturnValue(ret);
 }
 
 
@@ -10485,9 +10689,11 @@ void HOptimizedGraphBuilder::GenerateArrayBufferViewGetByteOffset(
   CHECK_ALIVE(VisitForValue(expr->arguments()->at(0)));
   HValue* view = Pop();
 
-  return ast_context()->ReturnValue(BuildArrayBufferViewFieldAccessor(
+  HValue* ret = BuildArrayBufferViewFieldAccessor(
       view, nullptr,
-      FieldIndex::ForInObjectOffset(JSArrayBufferView::kByteOffsetOffset)));
+      FieldIndex::ForInObjectOffset(JSArrayBufferView::kByteOffsetOffset));
+  GenerateTaintTrackingHook(ret, expr);
+  return ast_context()->ReturnValue(ret);
 }
 
 
@@ -10498,9 +10704,11 @@ void HOptimizedGraphBuilder::GenerateTypedArrayGetLength(
   CHECK_ALIVE(VisitForValue(expr->arguments()->at(0)));
   HValue* view = Pop();
 
-  return ast_context()->ReturnValue(BuildArrayBufferViewFieldAccessor(
+  HValue* ret = BuildArrayBufferViewFieldAccessor(
       view, nullptr,
-      FieldIndex::ForInObjectOffset(JSTypedArray::kLengthOffset)));
+      FieldIndex::ForInObjectOffset(JSTypedArray::kLengthOffset));
+  GenerateTaintTrackingHook(ret, expr);
+  return ast_context()->ReturnValue(ret);
 }
 
 
@@ -10531,14 +10739,15 @@ void HOptimizedGraphBuilder::VisitCallRuntime(CallRuntime* expr) {
                                                  TailCallMode::kDisallow,
                                                  TailCallMode::kDisallow);
     Drop(1);  // Function
+    GenerateTaintTrackingHook(call, expr);
     return ast_context()->ReturnInstruction(call, expr->id());
   }
 
   const Runtime::Function* function = expr->function();
   DCHECK(function != NULL);
   switch (function->function_id) {
-#define CALL_INTRINSIC_GENERATOR(Name) \
-  case Runtime::kInline##Name:         \
+#define CALL_INTRINSIC_GENERATOR(Name)      \
+  case Runtime::kInline##Name:              \
     return Generate##Name(expr);
 
     FOR_EACH_HYDROGEN_INTRINSIC(CALL_INTRINSIC_GENERATOR)
@@ -10548,6 +10757,7 @@ void HOptimizedGraphBuilder::VisitCallRuntime(CallRuntime* expr) {
       CHECK_ALIVE(VisitExpressions(expr->arguments()));
       PushArgumentsFromEnvironment(argument_count);
       HCallRuntime* call = New<HCallRuntime>(function, argument_count);
+      GenerateTaintTrackingHook(call, expr);
       return ast_context()->ReturnInstruction(call, expr->id());
     }
   }
@@ -10555,6 +10765,21 @@ void HOptimizedGraphBuilder::VisitCallRuntime(CallRuntime* expr) {
 
 
 void HOptimizedGraphBuilder::VisitUnaryOperation(UnaryOperation* expr) {
+  if (tainttracking::TaintTracker::FromIsolate(isolate())->
+      IsRewriteAstEnabled()) {
+    {
+      ValueContext for_value(this, ARGUMENTS_NOT_ALLOWED);
+      BuildUnaryOperation(expr);
+    }
+    HValue* ret = Pop();
+    GenerateTaintTrackingHook(ret, expr);
+    ast_context()->ReturnValue(ret);
+  } else {
+    BuildUnaryOperation(expr);
+  }
+}
+
+void HOptimizedGraphBuilder::BuildUnaryOperation(UnaryOperation* expr) {
   DCHECK(!HasStackOverflow());
   DCHECK(current_block() != NULL);
   DCHECK(current_block()->HasPredecessor());
@@ -10804,7 +11029,10 @@ void HOptimizedGraphBuilder::VisitCountOperation(CountOperation* expr) {
     }
 
     Drop(returns_original_input ? 2 : 1);
-    return ast_context()->ReturnValue(expr->is_postfix() ? input : after);
+
+    HValue* output = expr->is_postfix() ? input : after;
+    GenerateTaintTrackingHook(output, expr);
+    return ast_context()->ReturnValue(output);
   }
 
   // Argument of the count operation is a property.
@@ -10831,12 +11059,16 @@ void HOptimizedGraphBuilder::VisitCountOperation(CountOperation* expr) {
     environment()->SetExpressionStackAt(0, input);
     CHECK_ALIVE(BuildStoreForEffect(expr, prop, expr->CountSlot(), expr->id(),
                                     expr->AssignmentId(), object, key, after));
-    return ast_context()->ReturnValue(Pop());
+    HValue* ret = Pop();
+    GenerateTaintTrackingHook(ret, expr);
+    return ast_context()->ReturnValue(ret);
   }
 
   environment()->SetExpressionStackAt(0, after);
-  return BuildStore(expr, prop, expr->CountSlot(), expr->id(),
-                    expr->AssignmentId());
+  BuildStore(expr, prop, expr->CountSlot(), expr->id(),
+             expr->AssignmentId(),
+             tainttracking::ValueState::ADD_HOOK);
+  return;
 }
 
 
@@ -11319,10 +11551,35 @@ void HOptimizedGraphBuilder::VisitBinaryOperation(BinaryOperation* expr) {
   DCHECK(current_block()->HasPredecessor());
   switch (expr->op()) {
     case Token::COMMA:
-      return VisitComma(expr);
+      if (tainttracking::TaintTracker::FromIsolate(isolate())->
+          IsRewriteAstEnabled()) {
+        {
+          ValueContext for_value(this, ARGUMENTS_NOT_ALLOWED);
+          VisitComma(expr);
+        }
+        HValue* ret = Pop();
+        GenerateTaintTrackingHook(ret, expr);
+        ast_context()->ReturnValue(ret);
+      } else {
+        VisitComma(expr);
+      }
+      break;
     case Token::OR:
     case Token::AND:
-      return VisitLogicalExpression(expr);
+      if (tainttracking::TaintTracker::FromIsolate(isolate())->
+          IsRewriteAstEnabled()) {
+        {
+          ValueContext for_value(this, ARGUMENTS_NOT_ALLOWED);
+          VisitLogicalExpression(expr);
+        }
+        HValue* ret = Pop();
+        GenerateTaintTrackingHook(ret, expr);
+        ast_context()->ReturnValue(ret);
+      } else {
+        VisitLogicalExpression(expr);
+      }
+
+      break;
     default:
       return VisitArithmeticExpression(expr);
   }
@@ -11456,6 +11713,7 @@ void HOptimizedGraphBuilder::VisitArithmeticExpression(BinaryOperation* expr) {
         ScriptPositionToSourcePosition(expr->left()->position()),
         ScriptPositionToSourcePosition(expr->right()->position()));
   }
+  GenerateTaintTrackingHook(result, expr);
   return ast_context()->ReturnValue(result);
 }
 
@@ -11467,6 +11725,7 @@ void HOptimizedGraphBuilder::HandleLiteralCompareTypeof(CompareOperation* expr,
   SetSourcePosition(expr->position());
   HValue* value = Pop();
   HTypeofIsAndBranch* instr = New<HTypeofIsAndBranch>(value, check);
+  GenerateTaintTrackingHook(instr, expr);
   return ast_context()->ReturnControl(instr, expr->id());
 }
 
@@ -11517,6 +11776,7 @@ void HOptimizedGraphBuilder::VisitCompareOperation(CompareOperation* expr) {
     Literal* literal = expr->right()->AsLiteral();
     Handle<String> rhs = Handle<String>::cast(literal->value());
     HClassOfTestAndBranch* instr = New<HClassOfTestAndBranch>(value, rhs);
+    GenerateTaintTrackingHook(instr, expr);
     return ast_context()->ReturnControl(instr, expr->id());
   }
 
@@ -11534,6 +11794,7 @@ void HOptimizedGraphBuilder::VisitCompareOperation(CompareOperation* expr) {
   if (IsLiteralCompareStrict(isolate(), left, op, right)) {
     HCompareObjectEqAndBranch* result =
         New<HCompareObjectEqAndBranch>(left, right);
+    GenerateTaintTrackingHook(result, expr);
     return ast_context()->ReturnControl(result, expr->id());
   }
 
@@ -11560,6 +11821,7 @@ void HOptimizedGraphBuilder::VisitCompareOperation(CompareOperation* expr) {
             Add<HConstant>(handle(initial_map->prototype(), isolate()));
         HHasInPrototypeChainAndBranch* result =
             New<HHasInPrototypeChainAndBranch>(left, prototype);
+        GenerateTaintTrackingHook(result, expr);
         return ast_context()->ReturnControl(result, expr->id());
       }
     }
@@ -11570,6 +11832,7 @@ void HOptimizedGraphBuilder::VisitCompareOperation(CompareOperation* expr) {
     HCallWithDescriptor* result = New<HCallWithDescriptor>(
         stub, 0, callable.descriptor(), ArrayVector(values));
     result->set_type(HType::Boolean());
+    GenerateTaintTrackingHook(result, expr);
     return ast_context()->ReturnInstruction(result, expr->id());
 
   } else if (op == Token::IN) {
@@ -11579,6 +11842,7 @@ void HOptimizedGraphBuilder::VisitCompareOperation(CompareOperation* expr) {
     HInstruction* result =
         New<HCallWithDescriptor>(stub, 0, callable.descriptor(),
                                  Vector<HValue*>(values, arraysize(values)));
+    GenerateTaintTrackingHook(result, expr);
     return ast_context()->ReturnInstruction(result, expr->id());
   }
 
@@ -11591,6 +11855,7 @@ void HOptimizedGraphBuilder::VisitCompareOperation(CompareOperation* expr) {
       ScriptPositionToSourcePosition(expr->right()->position()),
       push_behavior, expr->id());
   if (compare == NULL) return;  // Bailed out.
+  GenerateTaintTrackingHook(compare, expr);
   return ast_context()->ReturnControl(compare, expr->id());
 }
 
@@ -11808,6 +12073,7 @@ void HOptimizedGraphBuilder::HandleLiteralCompareNil(CompareOperation* expr,
     DCHECK_EQ(Token::EQ, expr->op());
     instr = New<HIsUndetectableAndBranch>(value);
   }
+  GenerateTaintTrackingHook(instr, expr);
   return ast_context()->ReturnControl(instr, expr->id());
 }
 
@@ -12121,6 +12387,7 @@ void HOptimizedGraphBuilder::VisitThisFunction(ThisFunction* expr) {
   DCHECK(current_block() != NULL);
   DCHECK(current_block()->HasPredecessor());
   HInstruction* instr = BuildThisFunction();
+  GenerateTaintTrackingHook(instr, expr);
   return ast_context()->ReturnInstruction(instr, expr->id());
 }
 
@@ -12250,6 +12517,7 @@ void HOptimizedGraphBuilder::GenerateIsSmi(CallRuntime* call) {
   CHECK_ALIVE(VisitForValue(call->arguments()->at(0)));
   HValue* value = Pop();
   HIsSmiAndBranch* result = New<HIsSmiAndBranch>(value);
+  GenerateTaintTrackingHook(result, call);
   return ast_context()->ReturnControl(result, call->id());
 }
 
@@ -12262,6 +12530,7 @@ void HOptimizedGraphBuilder::GenerateIsJSReceiver(CallRuntime* call) {
       New<HHasInstanceTypeAndBranch>(value,
                                      FIRST_JS_RECEIVER_TYPE,
                                      LAST_JS_RECEIVER_TYPE);
+  GenerateTaintTrackingHook(result, call);
   return ast_context()->ReturnControl(result, call->id());
 }
 
@@ -12272,6 +12541,7 @@ void HOptimizedGraphBuilder::GenerateHasCachedArrayIndex(CallRuntime* call) {
   HValue* value = Pop();
   HHasCachedArrayIndexAndBranch* result =
       New<HHasCachedArrayIndexAndBranch>(value);
+  GenerateTaintTrackingHook(result, call);
   return ast_context()->ReturnControl(result, call->id());
 }
 
@@ -12282,6 +12552,7 @@ void HOptimizedGraphBuilder::GenerateIsArray(CallRuntime* call) {
   HValue* value = Pop();
   HHasInstanceTypeAndBranch* result =
       New<HHasInstanceTypeAndBranch>(value, JS_ARRAY_TYPE);
+  GenerateTaintTrackingHook(result, call);
   return ast_context()->ReturnControl(result, call->id());
 }
 
@@ -12292,6 +12563,7 @@ void HOptimizedGraphBuilder::GenerateIsTypedArray(CallRuntime* call) {
   HValue* value = Pop();
   HHasInstanceTypeAndBranch* result =
       New<HHasInstanceTypeAndBranch>(value, JS_TYPED_ARRAY_TYPE);
+  GenerateTaintTrackingHook(result, call);
   return ast_context()->ReturnControl(result, call->id());
 }
 
@@ -12302,6 +12574,7 @@ void HOptimizedGraphBuilder::GenerateIsRegExp(CallRuntime* call) {
   HValue* value = Pop();
   HHasInstanceTypeAndBranch* result =
       New<HHasInstanceTypeAndBranch>(value, JS_REGEXP_TYPE);
+  GenerateTaintTrackingHook(result, call);
   return ast_context()->ReturnControl(result, call->id());
 }
 
@@ -12311,6 +12584,7 @@ void HOptimizedGraphBuilder::GenerateToInteger(CallRuntime* call) {
   CHECK_ALIVE(VisitForValue(call->arguments()->at(0)));
   HValue* input = Pop();
   if (input->type().IsSmi()) {
+    GenerateTaintTrackingHook(input, call);
     return ast_context()->ReturnValue(input);
   } else {
     Callable callable = CodeFactory::ToInteger(isolate());
@@ -12318,6 +12592,7 @@ void HOptimizedGraphBuilder::GenerateToInteger(CallRuntime* call) {
     HValue* values[] = {context(), input};
     HInstruction* result = New<HCallWithDescriptor>(
         stub, 0, callable.descriptor(), ArrayVector(values));
+    GenerateTaintTrackingHook(result, call);
     return ast_context()->ReturnInstruction(result, call->id());
   }
 }
@@ -12328,6 +12603,7 @@ void HOptimizedGraphBuilder::GenerateToObject(CallRuntime* call) {
   CHECK_ALIVE(VisitForValue(call->arguments()->at(0)));
   HValue* value = Pop();
   HValue* result = BuildToObject(value);
+  GenerateTaintTrackingHook(result, call);
   return ast_context()->ReturnValue(result);
 }
 
@@ -12337,6 +12613,7 @@ void HOptimizedGraphBuilder::GenerateToString(CallRuntime* call) {
   CHECK_ALIVE(VisitForValue(call->arguments()->at(0)));
   HValue* input = Pop();
   if (input->type().IsString()) {
+    GenerateTaintTrackingHook(input, call);
     return ast_context()->ReturnValue(input);
   } else {
     Callable callable = CodeFactory::ToString(isolate());
@@ -12344,6 +12621,7 @@ void HOptimizedGraphBuilder::GenerateToString(CallRuntime* call) {
     HValue* values[] = {context(), input};
     HInstruction* result = New<HCallWithDescriptor>(
         stub, 0, callable.descriptor(), ArrayVector(values));
+    GenerateTaintTrackingHook(result, call);
     return ast_context()->ReturnInstruction(result, call->id());
   }
 }
@@ -12358,6 +12636,7 @@ void HOptimizedGraphBuilder::GenerateToLength(CallRuntime* call) {
   HValue* values[] = {context(), input};
   HInstruction* result = New<HCallWithDescriptor>(
       stub, 0, callable.descriptor(), ArrayVector(values));
+  GenerateTaintTrackingHook(result, call);
   return ast_context()->ReturnInstruction(result, call->id());
 }
 
@@ -12373,6 +12652,7 @@ void HOptimizedGraphBuilder::GenerateToNumber(CallRuntime* call) {
     Add<HSimulate>(call->id(), REMOVABLE_SIMULATE);
     if (!ast_context()->IsEffect()) result = Pop();
   }
+  GenerateTaintTrackingHook(result, call);
   return ast_context()->ReturnValue(result);
 }
 
@@ -12393,6 +12673,7 @@ void HOptimizedGraphBuilder::GenerateIsJSProxy(CallRuntime* call) {
       instance_type, Add<HConstant>(JS_PROXY_TYPE), Token::EQ);
 
   if_proxy.CaptureContinuation(&continuation);
+  GenerateTaintTrackingHookContinuation(&continuation, call);
   return ast_context()->ReturnContinuation(&continuation, call->id());
 }
 
@@ -12422,6 +12703,7 @@ void HOptimizedGraphBuilder::GenerateHasFastPackedElements(CallRuntime* call) {
     if_fast_packed.JoinContinuation(&continuation);
   }
   if_not_smi.JoinContinuation(&continuation);
+  GenerateTaintTrackingHookContinuation(&continuation, call);
   return ast_context()->ReturnContinuation(&continuation, call->id());
 }
 
@@ -12434,6 +12716,7 @@ void HOptimizedGraphBuilder::GenerateStringCharCodeAt(CallRuntime* call) {
   HValue* index = Pop();
   HValue* string = Pop();
   HInstruction* result = BuildStringCharCodeAt(string, index);
+  GenerateTaintTrackingHook(result, call);
   return ast_context()->ReturnInstruction(result, call->id());
 }
 
@@ -12444,6 +12727,7 @@ void HOptimizedGraphBuilder::GenerateStringCharFromCode(CallRuntime* call) {
   CHECK_ALIVE(VisitForValue(call->arguments()->at(0)));
   HValue* char_code = Pop();
   HInstruction* result = NewUncasted<HStringCharFromCode>(char_code);
+  GenerateTaintTrackingHook(result, call);
   return ast_context()->ReturnInstruction(result, call->id());
 }
 
@@ -12460,6 +12744,7 @@ void HOptimizedGraphBuilder::GenerateSubString(CallRuntime* call) {
       New<HCallWithDescriptor>(stub, call->arguments()->length(),
                                callable.descriptor(), ArrayVector(values));
   result->set_type(HType::String());
+  GenerateTaintTrackingHook(result, call);
   return ast_context()->ReturnInstruction(result, call->id());
 }
 
@@ -12473,6 +12758,7 @@ void HOptimizedGraphBuilder::GenerateNewObject(CallRuntime* call) {
   HConstant* stub_value = Add<HConstant>(stub.GetCode());
   HInstruction* result =
       New<HCallWithDescriptor>(stub_value, 0, descriptor, ArrayVector(values));
+  GenerateTaintTrackingHook(result, call);
   return ast_context()->ReturnInstruction(result, call->id());
 }
 
@@ -12487,6 +12773,7 @@ void HOptimizedGraphBuilder::GenerateRegExpExec(CallRuntime* call) {
   HInstruction* result =
       New<HCallWithDescriptor>(stub, call->arguments()->length(),
                                callable.descriptor(), ArrayVector(values));
+  GenerateTaintTrackingHook(result, call);
   return ast_context()->ReturnInstruction(result, call->id());
 }
 
@@ -12497,6 +12784,7 @@ void HOptimizedGraphBuilder::GenerateRegExpFlags(CallRuntime* call) {
   HValue* regexp = Pop();
   HInstruction* result =
       New<HLoadNamedField>(regexp, nullptr, HObjectAccess::ForJSRegExpFlags());
+  GenerateTaintTrackingHook(result, call);
   return ast_context()->ReturnInstruction(result, call->id());
 }
 
@@ -12507,6 +12795,7 @@ void HOptimizedGraphBuilder::GenerateRegExpSource(CallRuntime* call) {
   HValue* regexp = Pop();
   HInstruction* result =
       New<HLoadNamedField>(regexp, nullptr, HObjectAccess::ForJSRegExpSource());
+  GenerateTaintTrackingHook(result, call);
   return ast_context()->ReturnInstruction(result, call->id());
 }
 
@@ -12521,6 +12810,7 @@ void HOptimizedGraphBuilder::GenerateRegExpConstructResult(CallRuntime* call) {
   HValue* index = Pop();
   HValue* length = Pop();
   HValue* result = BuildRegExpConstructResult(length, index, input);
+  GenerateTaintTrackingHook(result, call);
   return ast_context()->ReturnValue(result);
 }
 
@@ -12531,6 +12821,7 @@ void HOptimizedGraphBuilder::GenerateNumberToString(CallRuntime* call) {
   CHECK_ALIVE(VisitForValue(call->arguments()->at(0)));
   HValue* number = Pop();
   HValue* result = BuildNumberToString(number, Type::Any());
+  GenerateTaintTrackingHook(result, call);
   return ast_context()->ReturnValue(result);
 }
 
@@ -12548,6 +12839,7 @@ void HOptimizedGraphBuilder::GenerateCall(CallRuntime* call) {
   HInstruction* result =
       New<HCallWithDescriptor>(trampoline, call->arguments()->length() - 1,
                                descriptor, ArrayVector(values));
+  GenerateTaintTrackingHook(result, call);
   return ast_context()->ReturnInstruction(result, call->id());
 }
 
@@ -12560,6 +12852,7 @@ void HOptimizedGraphBuilder::GenerateFixedArrayGet(CallRuntime* call) {
   HValue* object = Pop();
   HInstruction* result = New<HLoadKeyed>(
       object, index, nullptr, nullptr, FAST_HOLEY_ELEMENTS, ALLOW_RETURN_HOLE);
+  GenerateTaintTrackingHook(result, call);
   return ast_context()->ReturnInstruction(result, call->id());
 }
 
@@ -12574,13 +12867,17 @@ void HOptimizedGraphBuilder::GenerateFixedArraySet(CallRuntime* call) {
   HValue* object = Pop();
   NoObservableSideEffectsScope no_effects(this);
   Add<HStoreKeyed>(object, index, value, nullptr, FAST_HOLEY_ELEMENTS);
-  return ast_context()->ReturnValue(graph()->GetConstantUndefined());
+  HValue* result = graph()->GetConstantUndefined();
+  GenerateTaintTrackingHook(result, call);
+  return ast_context()->ReturnValue(result);
 }
 
 
 void HOptimizedGraphBuilder::GenerateTheHole(CallRuntime* call) {
   DCHECK(call->arguments()->length() == 0);
-  return ast_context()->ReturnValue(graph()->GetConstantHole());
+  HValue* result = graph()->GetConstantHole();
+  GenerateTaintTrackingHook(result, call);
+  return ast_context()->ReturnValue(result);
 }
 
 
@@ -12591,6 +12888,7 @@ void HOptimizedGraphBuilder::GenerateCreateIterResultObject(CallRuntime* call) {
   HValue* done = Pop();
   HValue* value = Pop();
   HValue* result = BuildCreateIterResultObject(value, done);
+  GenerateTaintTrackingHook(result, call);
   return ast_context()->ReturnValue(result);
 }
 
@@ -12601,6 +12899,7 @@ void HOptimizedGraphBuilder::GenerateJSCollectionGetTable(CallRuntime* call) {
   HValue* receiver = Pop();
   HInstruction* result = New<HLoadNamedField>(
       receiver, nullptr, HObjectAccess::ForJSCollectionTable());
+  GenerateTaintTrackingHook(result, call);
   return ast_context()->ReturnInstruction(result, call->id());
 }
 
@@ -12611,6 +12910,7 @@ void HOptimizedGraphBuilder::GenerateStringGetRawHashField(CallRuntime* call) {
   HValue* object = Pop();
   HInstruction* result = New<HLoadNamedField>(
       object, nullptr, HObjectAccess::ForStringHashField());
+  GenerateTaintTrackingHook(result, call);
   return ast_context()->ReturnInstruction(result, call->id());
 }
 
@@ -12678,6 +12978,7 @@ void HOptimizedGraphBuilder::GenerateSetInitialize(CallRuntime* call) {
   NoObservableSideEffectsScope no_effects(this);
   HValue* table = BuildAllocateOrderedHashTable<OrderedHashSet>();
   Add<HStoreNamedField>(receiver, HObjectAccess::ForJSCollectionTable(), table);
+  GenerateTaintTrackingHook(receiver, call);
   return ast_context()->ReturnValue(receiver);
 }
 
@@ -12690,6 +12991,7 @@ void HOptimizedGraphBuilder::GenerateMapInitialize(CallRuntime* call) {
   NoObservableSideEffectsScope no_effects(this);
   HValue* table = BuildAllocateOrderedHashTable<OrderedHashMap>();
   Add<HStoreNamedField>(receiver, HObjectAccess::ForJSCollectionTable(), table);
+  GenerateTaintTrackingHook(receiver, call);
   return ast_context()->ReturnValue(receiver);
 }
 
@@ -12718,7 +13020,9 @@ void HOptimizedGraphBuilder::GenerateSetClear(CallRuntime* call) {
 
   NoObservableSideEffectsScope no_effects(this);
   BuildOrderedHashTableClear<OrderedHashSet>(receiver);
-  return ast_context()->ReturnValue(graph()->GetConstantUndefined());
+  HValue* ret = graph()->GetConstantUndefined();
+  GenerateTaintTrackingHook(ret, call);
+  return ast_context()->ReturnValue(ret);
 }
 
 
@@ -12729,7 +13033,9 @@ void HOptimizedGraphBuilder::GenerateMapClear(CallRuntime* call) {
 
   NoObservableSideEffectsScope no_effects(this);
   BuildOrderedHashTableClear<OrderedHashMap>(receiver);
-  return ast_context()->ReturnValue(graph()->GetConstantUndefined());
+  HValue* ret = graph()->GetConstantUndefined();
+  GenerateTaintTrackingHook(ret, call);
+  return ast_context()->ReturnValue(ret);
 }
 
 
@@ -12738,6 +13044,7 @@ void HOptimizedGraphBuilder::GenerateGetCachedArrayIndex(CallRuntime* call) {
   CHECK_ALIVE(VisitForValue(call->arguments()->at(0)));
   HValue* value = Pop();
   HGetCachedArrayIndex* result = New<HGetCachedArrayIndex>(value);
+  GenerateTaintTrackingHook(result, call);
   return ast_context()->ReturnInstruction(result, call->id());
 }
 
@@ -12745,7 +13052,9 @@ void HOptimizedGraphBuilder::GenerateGetCachedArrayIndex(CallRuntime* call) {
 void HOptimizedGraphBuilder::GenerateDebugBreakInOptimizedCode(
     CallRuntime* call) {
   Add<HDebugBreak>();
-  return ast_context()->ReturnValue(graph()->GetConstant0());
+  HValue* result = graph()->GetConstant0();
+  GenerateTaintTrackingHook(result, call);
+  return ast_context()->ReturnValue(result);
 }
 
 
@@ -12755,8 +13064,71 @@ void HOptimizedGraphBuilder::GenerateDebugIsActive(CallRuntime* call) {
       Add<HConstant>(ExternalReference::debug_is_active_address(isolate()));
   HValue* value =
       Add<HLoadNamedField>(ref, nullptr, HObjectAccess::ForExternalUInteger8());
+  GenerateTaintTrackingHook(value, call);
   return ast_context()->ReturnValue(value);
 }
+
+
+void HOptimizedGraphBuilder::GenerateTaintTrackingHook(
+    tainttracking::ValueState value, Expression* node) {
+  return;
+
+  // TODO: fill in
+}
+
+void HOptimizedGraphBuilder::GenerateTaintTrackingHookConst(
+    bool value, Expression* node) {
+  return;
+
+  // TODO: fill in
+}
+
+void HOptimizedGraphBuilder::GenerateTaintTrackingHookContinuation(
+      HIfContinuation* cont, Expression* call) {
+  return;
+}
+
+void HOptimizedGraphBuilder::GenerateTaintTrackingHook(
+    HValue* value, Expression* node) {
+  DCHECK_NOT_NULL(value);
+
+  // Commenting out because this doesn't work
+  return;
+
+  if (!tainttracking::TaintTracker::FromIsolate(isolate())->
+      IsRewriteAstEnabled()) {
+    return;
+  }
+
+  Handle<Object> label;
+  if (node_label_serializer_.Serialize(
+          &label,
+          node->GetTaintTrackingLabel()) ==
+      tainttracking::Status::FAILURE) {
+    return;
+  }
+
+
+  Push(value);
+  Push(New<HConstant>(label));
+  Push(
+      New<HConstant>(
+          handle(Smi::FromInt(tainttracking::CheckType::EXPRESSION_AFTER),
+                 isolate())));
+
+  PushArgumentsFromEnvironment(tainttracking::kRuntimeOnControlFlowExpArgs);
+  HCallRuntime* call = New<HCallRuntime>(
+      Runtime::FunctionForId(
+          Runtime::kTaintTrackingHook),
+      tainttracking::kRuntimeOnControlFlowExpArgs);
+
+  // From return instruction in effect context
+  DCHECK(!call->IsControlInstruction());
+  AddInstruction(call);
+  DCHECK(call->HasObservableSideEffects());
+  Add<HSimulate>(node->id(), REMOVABLE_SIMULATE);
+}
+
 
 #undef CHECK_BAILOUT
 #undef CHECK_ALIVE

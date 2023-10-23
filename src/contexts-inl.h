@@ -5,6 +5,8 @@
 #ifndef V8_CONTEXTS_INL_H_
 #define V8_CONTEXTS_INL_H_
 
+#include <iostream>
+
 #include "src/contexts.h"
 #include "src/objects-inl.h"
 

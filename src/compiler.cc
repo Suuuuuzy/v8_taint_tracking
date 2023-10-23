@@ -33,6 +33,7 @@
 #include "src/parsing/scanner-character-streams.h"
 #include "src/runtime-profiler.h"
 #include "src/snapshot/code-serializer.h"
+#include "src/taint_tracking.h"
 #include "src/vm-state-inl.h"
 
 namespace v8 {
@@ -1086,6 +1087,8 @@ Handle<SharedFunctionInfo> CompileToplevel(CompilationInfo* info) {
 
   isolate->debug()->OnBeforeCompile(script);
 
+  tainttracking::TaintTracker::OnBeforeCompile(script, isolate);
+
   DCHECK(parse_info->is_eval() || parse_info->is_global() ||
          parse_info->is_module());
 
@@ -1195,6 +1198,7 @@ bool Compiler::Analyze(ParseInfo* info) {
   if (!Rewriter::Rewrite(info)) return false;
   if (!Scope::Analyze(info)) return false;
   if (!Renumber(info)) return false;
+  tainttracking::InsertControlFlowHook(info);
   DCHECK_NOT_NULL(info->scope());
   return true;
 }

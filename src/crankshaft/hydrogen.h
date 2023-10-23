@@ -2400,10 +2400,12 @@ class HOptimizedGraphBuilder : public HGraphBuilder,
                               Handle<JSFunction> target);
 
   int InliningAstSize(Handle<JSFunction> target);
-  bool TryInline(Handle<JSFunction> target, int arguments_count,
-                 HValue* implicit_return_value, BailoutId ast_id,
-                 BailoutId return_id, InliningKind inlining_kind,
-                 TailCallMode syntactic_tail_call_mode);
+  bool TryInline(
+      Handle<JSFunction> target, int arguments_count,
+      HValue* implicit_return_value, BailoutId ast_id,
+      BailoutId return_id, InliningKind inlining_kind,
+      TailCallMode syntactic_tail_call_mode,
+      Expression* taint_hook = nullptr);
 
   bool TryInlineCall(Call* expr);
   bool TryInlineConstruct(CallNew* expr, HValue* implicit_return_value);
@@ -2418,7 +2420,8 @@ class HOptimizedGraphBuilder : public HGraphBuilder,
                                   Handle<Map> receiver_map, BailoutId ast_id);
   bool TryInlineBuiltinMethodCall(Handle<JSFunction> function,
                                   Handle<Map> receiver_map, BailoutId ast_id,
-                                  int args_count_no_receiver);
+                                  int args_count_no_receiver,
+                                  Expression* taint_hook = nullptr);
   bool TryInlineBuiltinFunctionCall(Call* expr);
   enum ApiCallType {
     kCallApiFunction,
@@ -2434,10 +2437,12 @@ class HOptimizedGraphBuilder : public HGraphBuilder,
                           BailoutId ast_id);
   bool TryInlineApiSetter(Handle<Object> function, Handle<Map> receiver_map,
                           BailoutId ast_id);
-  bool TryInlineApiCall(Handle<Object> function, HValue* receiver,
-                        SmallMapList* receiver_maps, int argc, BailoutId ast_id,
-                        ApiCallType call_type,
-                        TailCallMode syntactic_tail_call_mode);
+  bool TryInlineApiCall(
+      Handle<Object> function, HValue* receiver,
+      SmallMapList* receiver_maps, int argc, BailoutId ast_id,
+      ApiCallType call_type,
+      TailCallMode syntactic_tail_call_mode,
+      Expression* taint_hook = nullptr);
   static bool IsReadOnlyLengthDescriptor(Handle<Map> jsarray_map);
   static bool CanInlineArrayResizeOperation(Handle<Map> receiver_map);
 
@@ -2772,7 +2777,9 @@ class HOptimizedGraphBuilder : public HGraphBuilder,
 
   void BuildStore(Expression* expression, Property* prop,
                   FeedbackVectorSlot slot, BailoutId ast_id,
-                  BailoutId return_id, bool is_uninitialized = false);
+                  BailoutId return_id, bool is_uninitialized = false,
+                  tainttracking::ValueState state =
+                  tainttracking::ValueState::NONE);
 
   HInstruction* BuildLoadNamedField(PropertyAccessInfo* info,
                                     HValue* checked_object);
@@ -2833,6 +2840,18 @@ class HOptimizedGraphBuilder : public HGraphBuilder,
 
   bool CanBeFunctionApplyArguments(Call* expr);
 
+
+  // Added to support taint tracking
+  void GenerateTaintTrackingHook(HValue* value, Expression* node);
+  void GenerateTaintTrackingHookConst(bool value, Expression* node);
+  void GenerateTaintTrackingHookContinuation(
+      HIfContinuation* cont, Expression* call);
+  void GenerateTaintTrackingHook(
+      tainttracking::ValueState value, Expression* node);
+  void BuildUnaryOperation(UnaryOperation* expr);
+
+
+
   // The translation state of the currently-being-translated function.
   FunctionState* function_state_;
 
@@ -2854,6 +2873,8 @@ class HOptimizedGraphBuilder : public HGraphBuilder,
   HOsrBuilder* osr_;
 
   AstTypeBounds bounds_;
+
+  tainttracking::V8NodeLabelSerializer node_label_serializer_;
 
   friend class FunctionState;  // Pushes and pops the state stack.
   friend class AstContext;  // Pushes and pops the AST context stack.

@@ -4547,6 +4547,12 @@ compiler::Node* FastNewFunctionContextStub::Generate(
 
   Node* min_context_slots =
       assembler->Int32Constant(Context::MIN_CONTEXT_SLOTS);
+
+  #ifdef V8_TAINT_TRACKING_INCLUDE_CONCOLIC
+  // Adding space for taint info
+  slots = assembler->Word32Shl(slots, assembler->Int32Constant(1));
+  #endif
+
   Node* length = assembler->Int32Add(slots, min_context_slots);
   Node* size = assembler->Int32Add(
       assembler->Word32Shl(length, assembler->Int32Constant(kPointerSizeLog2)),

@@ -473,6 +473,7 @@ void FullCodeGenerator::EmitSubString(CallRuntime* expr) {
   VisitForStackValue(args->at(2));
   __ CallStub(&stub);
   OperandStackDepthDecrement(3);
+  GenerateTaintTrackingHook(result_register(), expr);
   context()->Plug(result_register());
 }
 
@@ -488,6 +489,7 @@ void FullCodeGenerator::EmitRegExpExec(CallRuntime* expr) {
   VisitForStackValue(args->at(3));
   __ CallStub(&stub);
   OperandStackDepthDecrement(4);
+  GenerateTaintTrackingHook(result_register(), expr);
   context()->Plug(result_register());
 }
 
@@ -520,6 +522,7 @@ void FullCodeGenerator::EmitIntrinsicAsStubCall(CallRuntime* expr,
   // won't preserve the context register.
   LoadFromFrameField(StandardFrameConstants::kContextOffset,
                      context_register());
+  GenerateTaintTrackingHook(result_register(), expr);
   context()->Plug(result_register());
 }
 
@@ -567,19 +570,24 @@ void FullCodeGenerator::EmitHasProperty() {
   RestoreContext();
 }
 
-void FullCodeGenerator::RecordStatementPosition(int pos) {
+void FullCodeGenerator::RecordStatementPosition(
+    int pos, int ast_taint_tracking_index) {
   DCHECK_NE(kNoSourcePosition, pos);
-  source_position_table_builder_.AddPosition(masm_->pc_offset(), pos, true);
+  source_position_table_builder_.AddPosition(masm_->pc_offset(), pos, true,
+                                             ast_taint_tracking_index);
 }
 
-void FullCodeGenerator::RecordPosition(int pos) {
+void FullCodeGenerator::RecordPosition(
+    int pos, int ast_taint_tracking_index) {
   DCHECK_NE(kNoSourcePosition, pos);
-  source_position_table_builder_.AddPosition(masm_->pc_offset(), pos, false);
+  source_position_table_builder_.AddPosition(masm_->pc_offset(), pos, false,
+                                             ast_taint_tracking_index);
 }
 
 
 void FullCodeGenerator::SetFunctionPosition(FunctionLiteral* fun) {
-  RecordPosition(fun->start_position());
+  RecordPosition(fun->start_position(),
+                 fun->GetTaintTrackingLabel().GetCounter());
 }
 
 
@@ -587,7 +595,7 @@ void FullCodeGenerator::SetReturnPosition(FunctionLiteral* fun) {
   // For default constructors, start position equals end position, and there
   // is no source code besides the class literal.
   int pos = std::max(fun->start_position(), fun->end_position() - 1);
-  RecordStatementPosition(pos);
+  RecordStatementPosition(pos, fun->GetTaintTrackingLabel().GetCounter());
   if (info_->is_debug()) {
     // Always emit a debug break slot before a return.
     DebugCodegen::GenerateSlot(masm_, RelocInfo::DEBUG_BREAK_SLOT_AT_RETURN);
@@ -598,7 +606,8 @@ void FullCodeGenerator::SetReturnPosition(FunctionLiteral* fun) {
 void FullCodeGenerator::SetStatementPosition(
     Statement* stmt, FullCodeGenerator::InsertBreak insert_break) {
   if (stmt->position() == kNoSourcePosition) return;
-  RecordStatementPosition(stmt->position());
+  RecordStatementPosition(stmt->position(),
+                          stmt->GetTaintTrackingLabel().GetCounter());
   if (insert_break == INSERT_BREAK && info_->is_debug() &&
       !stmt->IsDebuggerStatement()) {
     DebugCodegen::GenerateSlot(masm_, RelocInfo::DEBUG_BREAK_SLOT_AT_POSITION);
@@ -607,13 +616,14 @@ void FullCodeGenerator::SetStatementPosition(
 
 void FullCodeGenerator::SetExpressionPosition(Expression* expr) {
   if (expr->position() == kNoSourcePosition) return;
-  RecordPosition(expr->position());
+  RecordPosition(expr->position(), expr->GetTaintTrackingLabel().GetCounter());
 }
 
 
 void FullCodeGenerator::SetExpressionAsStatementPosition(Expression* expr) {
   if (expr->position() == kNoSourcePosition) return;
-  RecordStatementPosition(expr->position());
+  RecordStatementPosition(expr->position(),
+                          expr->GetTaintTrackingLabel().GetCounter());
   if (info_->is_debug()) {
     DebugCodegen::GenerateSlot(masm_, RelocInfo::DEBUG_BREAK_SLOT_AT_POSITION);
   }
@@ -622,7 +632,7 @@ void FullCodeGenerator::SetExpressionAsStatementPosition(Expression* expr) {
 void FullCodeGenerator::SetCallPosition(Expression* expr,
                                         TailCallMode tail_call_mode) {
   if (expr->position() == kNoSourcePosition) return;
-  RecordPosition(expr->position());
+  RecordPosition(expr->position(), expr->GetTaintTrackingLabel().GetCounter());
   if (info_->is_debug()) {
     RelocInfo::Mode mode = (tail_call_mode == TailCallMode::kAllow)
                                ? RelocInfo::DEBUG_BREAK_SLOT_AT_TAIL_CALL
@@ -649,17 +659,43 @@ void FullCodeGenerator::VisitSuperCallReference(SuperCallReference* super) {
 
 
 void FullCodeGenerator::EmitDebugBreakInOptimizedCode(CallRuntime* expr) {
-  context()->Plug(handle(Smi::FromInt(0), isolate()));
+  Handle<Object> ret = handle(Smi::FromInt(0), isolate());
+  GenerateTaintTrackingHook(ret, expr);
+  context()->Plug(ret);
 }
 
 
 void FullCodeGenerator::VisitBinaryOperation(BinaryOperation* expr) {
   switch (expr->op()) {
     case Token::COMMA:
-      return VisitComma(expr);
+      if (tainttracking::TaintTracker::FromIsolate(isolate())->
+          IsRewriteAstEnabled()) {
+        {
+          AccumulatorValueContext for_stack(this);
+          VisitComma(expr);
+        }
+        GenerateTaintTrackingHook(rax, expr);
+        context()->Plug(rax);
+      } else {
+        VisitComma(expr);
+      }
+      break;
+
     case Token::OR:
     case Token::AND:
-      return VisitLogicalExpression(expr);
+      if (tainttracking::TaintTracker::FromIsolate(isolate())->
+          IsRewriteAstEnabled()) {
+        {
+          AccumulatorValueContext for_value(this);
+          VisitLogicalExpression(expr);
+        }
+        GenerateTaintTrackingHook(rax, expr);
+        context()->Plug(rax);
+      } else {
+        VisitLogicalExpression(expr);
+      }
+
+      break;
     default:
       return VisitArithmeticExpression(expr);
   }
@@ -687,6 +723,36 @@ void FullCodeGenerator::VisitComma(BinaryOperation* expr) {
   VisitInDuplicateContext(expr->right());
 }
 
+
+void FullCodeGenerator::VisitInDuplicateContextAndHookTaint(
+    Expression* eval, Expression* hook) {
+  if (context()->IsTest()) {
+    Label if_true, if_false;
+    const TestContext* for_test = TestContext::cast(context());
+    VisitForControl(eval,
+                    &if_true,
+                    &if_false,
+                    &if_true);
+
+    __ bind(&if_true);
+    GenerateTaintTrackingHookImmediate(true, hook);
+    __ jmp(for_test->true_label());
+    __ bind(&if_false);
+    GenerateTaintTrackingHookImmediate(false, hook);
+    __ jmp(for_test->false_label());
+  } else if (context()->IsStackValue()) {
+    VisitForStackValue(eval);
+    GenerateTaintTrackingHookTOS(hook);
+  } else if (context()->IsAccumulatorValue()) {
+    VisitForAccumulatorValue(eval);
+    GenerateTaintTrackingHook(result_register(), hook);
+  } else {
+    DCHECK(context()->IsEffect());
+    VisitForEffect(eval);
+    GenerateTaintTrackingHook(
+        tainttracking::ValueState::OPTIMIZED_OUT, hook);
+  }
+}
 
 void FullCodeGenerator::VisitLogicalExpression(BinaryOperation* expr) {
   bool is_logical_and = expr->op() == Token::AND;
@@ -720,6 +786,8 @@ void FullCodeGenerator::VisitLogicalExpression(BinaryOperation* expr) {
     }
     __ bind(&restore);
     __ Pop(result_register());
+    GenerateTaintTrackingHook(
+        tainttracking::ValueState::UNEXECUTED, right);
     __ jmp(&done);
     __ bind(&discard);
     __ Drop(1);
@@ -767,10 +835,13 @@ void FullCodeGenerator::VisitArithmeticExpression(BinaryOperation* expr) {
   VisitForAccumulatorValue(right);
 
   SetExpressionPosition(expr);
+
+  GenerateTaintTrackingMessageOriginCheck(op);
+
   if (ShouldInlineSmiCase(op)) {
     EmitInlineSmiBinaryOp(expr, op, left, right);
   } else {
-    EmitBinaryOp(expr, op);
+    EmitBinaryOp(expr, op, tainttracking::ValueState::ADD_HOOK);
   }
 }
 
@@ -783,6 +854,11 @@ void FullCodeGenerator::VisitProperty(Property* expr) {
   if (key->IsPropertyName()) {
     if (!expr->IsSuperAccess()) {
       VisitForAccumulatorValue(expr->obj());
+
+      PushOperand(rax);
+      GenerateTaintTrackingHookBefore(rax, expr);
+      PopOperand(rax);
+
       __ Move(LoadDescriptor::ReceiverRegister(), result_register());
       EmitNamedPropertyLoad(expr);
     } else {
@@ -794,6 +870,10 @@ void FullCodeGenerator::VisitProperty(Property* expr) {
   } else {
     if (!expr->IsSuperAccess()) {
       VisitForStackValue(expr->obj());
+
+      __ movp(rax, Operand(rsp, 0));
+      GenerateTaintTrackingHookBefore(rax, expr);
+
       VisitForAccumulatorValue(expr->key());
       __ Move(LoadDescriptor::NameRegister(), result_register());
       PopOperand(LoadDescriptor::ReceiverRegister());
@@ -807,6 +887,7 @@ void FullCodeGenerator::VisitProperty(Property* expr) {
     }
   }
   PrepareForBailoutForId(expr->LoadId(), BailoutState::TOS_REGISTER);
+  GenerateTaintTrackingHook(result_register(), expr);
   context()->Plug(result_register());
 }
 
@@ -843,7 +924,7 @@ void FullCodeGenerator::VisitDoExpression(DoExpression* expr) {
   Comment cmnt(masm_, "[ Do Expression");
   SetExpressionPosition(expr);
   VisitBlock(expr->block());
-  VisitInDuplicateContext(expr->result());
+  VisitInDuplicateContextAndHookTaint(expr->result(), expr);
 }
 
 
@@ -982,7 +1063,8 @@ void FullCodeGenerator::EmitUnwindAndReturn() {
   EmitReturnSequence();
 }
 
-void FullCodeGenerator::EmitNewClosure(Handle<SharedFunctionInfo> info,
+void FullCodeGenerator::EmitNewClosure(Expression* expr,
+                                       Handle<SharedFunctionInfo> info,
                                        bool pretenure) {
   // If we're running with the --always-opt or the --prepare-always-opt
   // flag, we need to use the runtime function so that the new function
@@ -998,12 +1080,26 @@ void FullCodeGenerator::EmitNewClosure(Handle<SharedFunctionInfo> info,
     __ CallRuntime(pretenure ? Runtime::kNewClosure_Tenured
                              : Runtime::kNewClosure);
   }
+  GenerateTaintTrackingHook(result_register(), expr);
   context()->Plug(result_register());
 }
 
 void FullCodeGenerator::EmitNamedPropertyLoad(Property* prop) {
-  SetExpressionPosition(prop);
   Literal* key = prop->key()->AsLiteral();
+
+  if (tainttracking::TaintTracker::FromIsolate(isolate_)->
+      IsRewriteAstEnabled()) {
+    PushOperand(LoadDescriptor::ReceiverRegister());
+    PushOperand(rax);
+
+    GenerateTaintTrackingHook(
+        tainttracking::ValueState::STATIC_VALUE, key);
+
+    PopOperand(rax);
+    PopOperand(LoadDescriptor::ReceiverRegister());
+  }
+
+  SetExpressionPosition(prop);
   DCHECK(!key->value()->IsSmi());
   DCHECK(!prop->IsSuperAccess());
 
@@ -1011,6 +1107,8 @@ void FullCodeGenerator::EmitNamedPropertyLoad(Property* prop) {
   __ Move(LoadDescriptor::SlotRegister(),
           SmiFromSlot(prop->PropertyFeedbackSlot()));
   CallLoadIC();
+
+  DCHECK(key->IsLiteral() || key->IsUnaryOperation());
 }
 
 void FullCodeGenerator::EmitNamedSuperPropertyLoad(Property* prop) {
@@ -1057,6 +1155,7 @@ void FullCodeGenerator::VisitReturnStatement(ReturnStatement* stmt) {
   SetStatementPosition(stmt);
   Expression* expr = stmt->expression();
   VisitForAccumulatorValue(expr);
+  GenerateTaintTrackingHookSetReturn(rax, expr);
   EmitUnwindAndReturn();
 }
 
@@ -1249,6 +1348,7 @@ void FullCodeGenerator::VisitForOfStatement(ForOfStatement* stmt) {
 void FullCodeGenerator::VisitThisFunction(ThisFunction* expr) {
   LoadFromFrameField(JavaScriptFrameConstants::kFunctionOffset,
                      result_register());
+  GenerateTaintTrackingHook(result_register(), expr);
   context()->Plug(result_register());
 }
 
@@ -1294,12 +1394,12 @@ void FullCodeGenerator::VisitTryCatchStatement(TryCatchStatement* stmt) {
   __ bind(&try_entry);
 
   int handler_index = NewHandlerTableEntry();
-  EnterTryBlock(handler_index, &handler_entry, stmt->catch_prediction());
+  EnterTryBlock(handler_index, &handler_entry, stmt->catch_prediction(), stmt);
   {
     Comment cmnt_try(masm(), "[ Try block");
     Visit(stmt->try_block());
   }
-  ExitTryBlock(handler_index);
+  ExitTryBlock(handler_index, stmt);
   __ bind(&exit);
 }
 
@@ -1343,13 +1443,13 @@ void FullCodeGenerator::VisitTryFinallyStatement(TryFinallyStatement* stmt) {
   // Set up try handler.
   __ bind(&try_entry);
   int handler_index = NewHandlerTableEntry();
-  EnterTryBlock(handler_index, &handler_entry, stmt->catch_prediction());
+  EnterTryBlock(handler_index, &handler_entry, stmt->catch_prediction(), stmt);
   {
     Comment cmnt_try(masm(), "[ Try block");
     TryFinally try_body(this, &deferred);
     Visit(stmt->try_block());
   }
-  ExitTryBlock(handler_index);
+  ExitTryBlock(handler_index, stmt);
   // Execute the finally block on the way out.  Clobber the unpredictable
   // value in the result register with one that's safe for GC because the
   // finally block will unconditionally preserve the result register on the
@@ -1400,32 +1500,47 @@ void FullCodeGenerator::VisitConditional(Conditional* expr) {
   int original_stack_depth = operand_stack_depth_;
   PrepareForBailoutForId(expr->ThenId(), BailoutState::NO_REGISTERS);
   __ bind(&true_case);
+  GenerateTaintTrackingHook(
+      tainttracking::ValueState::UNEXECUTED, expr->else_expression());
   SetExpressionPosition(expr->then_expression());
   if (context()->IsTest()) {
+    Label if_true, if_false;
     const TestContext* for_test = TestContext::cast(context());
     VisitForControl(expr->then_expression(),
-                    for_test->true_label(),
-                    for_test->false_label(),
-                    NULL);
+                    &if_true,
+                    &if_false,
+                    &if_true);
+
+    __ bind(&if_true);
+    GenerateTaintTrackingHookImmediate(true, expr);
+    __ jmp(for_test->true_label());
+    __ bind(&if_false);
+    GenerateTaintTrackingHookImmediate(false, expr);
+    __ jmp(for_test->false_label());
+
   } else {
-    VisitInDuplicateContext(expr->then_expression());
+    VisitInDuplicateContextAndHookTaint(expr->then_expression(), expr);
     __ jmp(&done);
   }
 
   operand_stack_depth_ = original_stack_depth;
   PrepareForBailoutForId(expr->ElseId(), BailoutState::NO_REGISTERS);
   __ bind(&false_case);
+  GenerateTaintTrackingHook(
+      tainttracking::ValueState::UNEXECUTED, expr->then_expression());
   SetExpressionPosition(expr->else_expression());
-  VisitInDuplicateContext(expr->else_expression());
+
+  VisitInDuplicateContextAndHookTaint(expr->else_expression(), expr);
   // If control flow falls through Visit, merge it with true case here.
   if (!context()->IsTest()) {
-    __ bind(&done);
+  __ bind(&done);
   }
 }
 
 
 void FullCodeGenerator::VisitLiteral(Literal* expr) {
   Comment cmnt(masm_, "[ Literal");
+  GenerateTaintTrackingHook(expr->value(), expr);
   context()->Plug(expr->value());
 }
 
@@ -1440,7 +1555,7 @@ void FullCodeGenerator::VisitFunctionLiteral(FunctionLiteral* expr) {
     SetStackOverflow();
     return;
   }
-  EmitNewClosure(function_info, expr->pretenure());
+  EmitNewClosure(expr, function_info, expr->pretenure());
 }
 
 
@@ -1481,6 +1596,7 @@ void FullCodeGenerator::VisitClassLiteral(ClassLiteral* lit) {
                            lit->ProxySlot());
   }
 
+  GenerateTaintTrackingHook(result_register(), lit);
   context()->Plug(result_register());
 }
 
@@ -1500,6 +1616,7 @@ void FullCodeGenerator::VisitRegExpLiteral(RegExpLiteral* expr) {
   // won't preserve the context register.
   LoadFromFrameField(StandardFrameConstants::kContextOffset,
                      context_register());
+  GenerateTaintTrackingHook(result_register(), expr);
   context()->Plug(result_register());
 }
 
@@ -1508,13 +1625,14 @@ void FullCodeGenerator::VisitNativeFunctionLiteral(
   Comment cmnt(masm_, "[ NativeFunctionLiteral");
   Handle<SharedFunctionInfo> shared =
       Compiler::GetSharedFunctionInfoForNative(expr->extension(), expr->name());
-  EmitNewClosure(shared, false);
+  EmitNewClosure(expr, shared, false);
 }
 
 
 void FullCodeGenerator::VisitThrow(Throw* expr) {
   Comment cmnt(masm_, "[ Throw");
   VisitForStackValue(expr->exception());
+  GenerateTaintTrackingHookTOS(expr);
   SetExpressionPosition(expr);
   CallRuntimeWithOperands(Runtime::kThrow);
   // Never returns here.
@@ -1526,12 +1644,15 @@ void FullCodeGenerator::VisitThrow(Throw* expr) {
 
 void FullCodeGenerator::EnterTryBlock(
     int handler_index, Label* handler,
-    HandlerTable::CatchPrediction catch_prediction) {
+    HandlerTable::CatchPrediction catch_prediction,
+    Statement* stmt) {
   HandlerTableEntry* entry = &handler_table_[handler_index];
   entry->range_start = masm()->pc_offset();
   entry->handler_offset = handler->pos();
   entry->stack_depth = operand_stack_depth_;
   entry->catch_prediction = catch_prediction;
+
+  GenerateTaintTrackingHookEnterTry(stmt);
 
   // We are using the operand stack depth, check for accuracy.
   EmitOperandStackDepthCheck();
@@ -1542,9 +1663,11 @@ void FullCodeGenerator::EnterTryBlock(
 }
 
 
-void FullCodeGenerator::ExitTryBlock(int handler_index) {
+void FullCodeGenerator::ExitTryBlock(int handler_index, Statement* stmt) {
   HandlerTableEntry* entry = &handler_table_[handler_index];
   entry->range_end = masm()->pc_offset();
+
+  GenerateTaintTrackingHookExitTry(stmt);
 
   // Drop context from operand stack.
   DropOperands(TryBlockConstant::kElementCount);
@@ -1556,6 +1679,8 @@ void FullCodeGenerator::VisitCall(Call* expr) {
   // We want to verify that RecordJSReturnSite gets called on all paths
   // through this function.  Avoid early returns.
   expr->return_is_recorded_ = false;
+  expr->symbolized_args_ = 0;
+  expr->symbolized_enter_is_recorded_ = false;
 #endif
 
   Comment cmnt(masm_, (expr->tail_call_mode() == TailCallMode::kAllow)
@@ -1564,11 +1689,14 @@ void FullCodeGenerator::VisitCall(Call* expr) {
   Expression* callee = expr->expression();
   Call::CallType call_type = expr->GetCallType(isolate());
 
+  GenerateTaintTrackingPrepareFrame(tainttracking::FrameType::JS);
+
   switch (call_type) {
     case Call::POSSIBLY_EVAL_CALL:
       EmitPossiblyEvalCall(expr);
       break;
     case Call::GLOBAL_CALL:
+      GenerateTaintTrackingHookReceiverTOS(nullptr);
       EmitCallWithLoadIC(expr);
       break;
     case Call::LOOKUP_SLOT_CALL:
@@ -1579,12 +1707,14 @@ void FullCodeGenerator::VisitCall(Call* expr) {
     case Call::NAMED_PROPERTY_CALL: {
       Property* property = callee->AsProperty();
       VisitForStackValue(property->obj());
+      GenerateTaintTrackingHookReceiverTOS(property->obj());
       EmitCallWithLoadIC(expr);
       break;
     }
     case Call::KEYED_PROPERTY_CALL: {
       Property* property = callee->AsProperty();
       VisitForStackValue(property->obj());
+      GenerateTaintTrackingHookReceiverTOS(property->obj());
       EmitKeyedCallWithLoadIC(expr, property->key());
       break;
     }
@@ -1602,15 +1732,25 @@ void FullCodeGenerator::VisitCall(Call* expr) {
       VisitForStackValue(callee);
       OperandStackDepthIncrement(1);
       __ PushRoot(Heap::kUndefinedValueRootIndex);
+      GenerateTaintTrackingHookReceiverTOS(callee);
       // Emit function call.
       EmitCall(expr);
       break;
   }
 
 #ifdef DEBUG
+#ifdef V8_TAINT_TRACKING_INCLUDE_CONCOLIC
+  if (!expr->symbolized_enter_is_recorded_ ||
+      !expr->return_is_recorded_) {
+    std::cerr << "Reason: " << call_type << std::endl;
+  }
+
   // RecordJSReturnSite should have been called.
   DCHECK(expr->return_is_recorded_);
-#endif
+  DCHECK(expr->symbolized_enter_is_recorded_);
+  DCHECK_EQ(expr->symbolized_args_, expr->arguments()->length());
+#endif  // V8_TAINT_TRACKING_INCLUDE_CONCOLIC
+#endif  // DEBUG
 }
 
 void FullCodeGenerator::VisitCallRuntime(CallRuntime* expr) {
@@ -1621,17 +1761,32 @@ void FullCodeGenerator::VisitCallRuntime(CallRuntime* expr) {
     Comment cmnt(masm_, "[ CallRuntime");
     EmitLoadJSRuntimeFunction(expr);
 
+    GenerateTaintTrackingPrepareFrame(
+        tainttracking::FrameType::JS_CALL_RUNTIME);
+
     // Push the arguments ("left-to-right").
     for (int i = 0; i < arg_count; i++) {
       VisitForStackValue(args->at(i));
+      GenerateTaintTrackingAddArgument(args->at(i));
     }
 
     PrepareForBailoutForId(expr->CallId(), BailoutState::NO_REGISTERS);
+
+    GenerateTaintTrackingEnterFrame();
+
     EmitCallJSRuntimeFunction(expr);
+    GenerateTaintTrackingExitFrame();
+
+    GenerateTaintTrackingHook(result_register(), expr);
     context()->DropAndPlug(1, result_register());
 
   } else {
     const Runtime::Function* function = expr->function();
+    if (function->function_id == Runtime::kInlineCall) {
+      GenerateTaintTrackingPrepareFrame(
+          tainttracking::FrameType::RUNTIME_CALL);
+    }
+
     switch (function->function_id) {
 #define CALL_INTRINSIC_GENERATOR(Name)     \
   case Runtime::kInline##Name: {           \
@@ -1642,15 +1797,26 @@ void FullCodeGenerator::VisitCallRuntime(CallRuntime* expr) {
 #undef CALL_INTRINSIC_GENERATOR
       default: {
         Comment cmnt(masm_, "[ CallRuntime for unhandled intrinsic");
+
+        GenerateTaintTrackingPrepareFrame(
+            tainttracking::FrameType::JS_CALL_RUNTIME);
+
         // Push the arguments ("left-to-right").
         for (int i = 0; i < arg_count; i++) {
           VisitForStackValue(args->at(i));
+          GenerateTaintTrackingAddArgument(args->at(i));
         }
 
         // Call the C runtime function.
         PrepareForBailoutForId(expr->CallId(), BailoutState::NO_REGISTERS);
+
+        GenerateTaintTrackingEnterFrame();
+
         __ CallRuntime(expr->function(), arg_count);
         OperandStackDepthDecrement(arg_count);
+        GenerateTaintTrackingExitFrame();
+
+        GenerateTaintTrackingHook(result_register(), expr);
         context()->Plug(result_register());
       }
     }
@@ -1742,19 +1908,84 @@ bool FullCodeGenerator::TryLiteralCompare(CompareOperation* expr) {
   Handle<String> check;
   if (expr->IsLiteralCompareTypeof(&sub_expr, &check)) {
     SetExpressionPosition(expr);
-    EmitLiteralCompareTypeof(expr, sub_expr, check);
+
+    Expression* typeofexpr;
+    if (expr->left()->IsLiteral()) {
+      DCHECK(expr->left()->IsLiteral());
+      GenerateTaintTrackingHook(
+          tainttracking::ValueState::STATIC_VALUE, expr->left());
+      typeofexpr = expr->right();
+    } else {
+      DCHECK(expr->right()->IsLiteral());
+      GenerateTaintTrackingHook(
+          tainttracking::ValueState::STATIC_VALUE, expr->right());
+      typeofexpr = expr->left();
+    }
+
+    if (tainttracking::TaintTracker::FromIsolate(isolate_)->
+        IsRewriteAstEnabled()) {
+      {
+        StackValueContext on_stack(this);
+        EmitLiteralCompareTypeof(
+            expr, sub_expr, check, typeofexpr);
+      }
+      GenerateTaintTrackingHookTOS(expr);
+      context()->PlugTOS();
+    } else {
+      EmitLiteralCompareTypeof(expr, sub_expr, check);
+    }
     return true;
   }
 
   if (expr->IsLiteralCompareUndefined(&sub_expr)) {
     SetExpressionPosition(expr);
-    EmitLiteralCompareNil(expr, sub_expr, kUndefinedValue);
+
+    if (sub_expr == expr->right()) {
+      GenerateTaintTrackingHook(
+          tainttracking::ValueState::STATIC_VALUE, expr->left());
+    } else {
+      DCHECK(sub_expr == expr->left());
+      GenerateTaintTrackingHook(
+          tainttracking::ValueState::STATIC_VALUE, expr->right());
+    }
+
+    if (tainttracking::TaintTracker::FromIsolate(isolate_)->
+        IsRewriteAstEnabled()) {
+      {
+        StackValueContext on_stack(this);
+        EmitLiteralCompareNil(expr, sub_expr, kUndefinedValue);
+      }
+      GenerateTaintTrackingHookTOS(expr);
+      context()->PlugTOS();
+    } else {
+      EmitLiteralCompareNil(expr, sub_expr, kUndefinedValue);
+    }
     return true;
   }
 
   if (expr->IsLiteralCompareNull(&sub_expr)) {
     SetExpressionPosition(expr);
-    EmitLiteralCompareNil(expr, sub_expr, kNullValue);
+
+    if (sub_expr == expr->right()) {
+      GenerateTaintTrackingHook(
+          tainttracking::ValueState::STATIC_VALUE, expr->left());
+    } else {
+      DCHECK(sub_expr == expr->left());
+      GenerateTaintTrackingHook(
+          tainttracking::ValueState::STATIC_VALUE, expr->right());
+    }
+
+    if (tainttracking::TaintTracker::FromIsolate(isolate_)->
+        IsRewriteAstEnabled()) {
+      {
+        StackValueContext on_stack(this);
+        EmitLiteralCompareNil(expr, sub_expr, kNullValue);
+      }
+      GenerateTaintTrackingHookTOS(expr);
+      context()->PlugTOS();
+    } else {
+      EmitLiteralCompareNil(expr, sub_expr, kNullValue);
+    }
     return true;
   }
 
@@ -1937,6 +2168,533 @@ bool FullCodeGenerator::NeedsHoleCheckForLoad(VariableProxy* proxy) {
          var->initializer_position() >= proxy->position();
 }
 
+
+tainttracking::Status FullCodeGenerator::GenerateTaintTrackingPrepare(
+    AstNode* expr, Handle<Object>* label) {
+  DCHECK_NOT_NULL(isolate_);
+  if (!tainttracking::TaintTracker::FromIsolate(isolate_)->
+      IsRewriteAstEnabled()) {
+    return tainttracking::Status::FAILURE;
+  }
+
+  return node_label_serializer_.Serialize(
+      label, expr->GetTaintTrackingLabel());
+}
+
+void FullCodeGenerator::GenerateTaintTrackingBody(
+    Handle<Object> label,
+    tainttracking::CheckType checktype) {
+  PushOperand(label);
+  PushOperand(Smi::FromInt(static_cast<uint32_t>(checktype)));
+
+  const Runtime::Function* check = Runtime::FunctionForId(
+      Runtime::kTaintTrackingHook);
+  // Call the C runtime function.
+  __ CallRuntime(check, check->nargs);
+  OperandStackDepthDecrement(check->nargs);
+}
+
+void FullCodeGenerator::GenerateTaintTrackingHookBefore(
+    Register reg, Expression* expr) {
+  Handle<Object> node_label;
+  if (GenerateTaintTrackingPrepare(expr, &node_label) ==
+      tainttracking::Status::FAILURE) {
+    return;
+  }
+
+  Comment cmnt(masm_, "[ CallRuntime Taint Tracking Hook Register");
+  PushOperand(reg);
+  GenerateTaintTrackingBody(
+      node_label, tainttracking::CheckType::EXPRESSION_BEFORE);
+}
+
+void FullCodeGenerator::GenerateTaintTrackingHook(
+    Register reg, Expression* expr) {
+  Handle<Object> node_label;
+  if (GenerateTaintTrackingPrepare(expr, &node_label) ==
+      tainttracking::Status::FAILURE) {
+    return;
+  }
+
+  Comment cmnt(masm_, "[ CallRuntime Taint Tracking Hook Register");
+  PushOperand(reg);
+  GenerateTaintTrackingBody(
+      node_label, tainttracking::CheckType::EXPRESSION_AFTER);
+}
+
+void FullCodeGenerator::GenerateTaintTrackingHook(
+    tainttracking::ValueState value, AstNode* expr) {
+  Handle<Object> node_label;
+  if (GenerateTaintTrackingPrepare(expr, &node_label) ==
+      tainttracking::Status::FAILURE) {
+    return;
+  }
+
+  Comment cmnt(masm_, "[ CallRuntime Taint Tracking Hook ValueState");
+  PushOperand(result_register());
+  PushOperand(handle(isolate_->heap()->undefined_value(), isolate_));
+  tainttracking::CheckType checktype;
+  switch (value) {
+    case tainttracking::ValueState::OPTIMIZED_OUT:
+      checktype = tainttracking::CheckType::EXPRESSION_AFTER_OPTIMIZED_OUT;
+      break;
+    case tainttracking::ValueState::STATIC_VALUE:
+      DCHECK(expr->IsLiteral() || expr->IsUnaryOperation() ||
+             (expr->IsVariableProxy() &&
+              expr->AsVariableProxy()->IsUndefinedLiteral()) ||
+             expr->IsArrayLiteral() ||
+             expr->IsObjectLiteral());
+      checktype = tainttracking::CheckType::STATIC_VALUE_CHECK;
+      break;
+    case tainttracking::ValueState::UNEXECUTED:
+      checktype = tainttracking::CheckType::EXPRESSION_UNEXECUTED;
+      break;
+    case tainttracking::ValueState::STATEMENT:
+      checktype = tainttracking::CheckType::STATEMENT_AFTER;
+      break;
+    case tainttracking::ValueState::LVALUE:
+      checktype = tainttracking::CheckType::EXPRESSION_LVALUE;
+      break;
+    case tainttracking::ValueState::PROPERTY_LVALUE:
+      checktype = tainttracking::CheckType::EXPRESSION_PROPERTY_LVALUE;
+      break;
+    default:
+      UNREACHABLE();
+  }
+  GenerateTaintTrackingBody(node_label, checktype);
+  PopOperand(result_register());
+}
+
+void FullCodeGenerator::GenerateTaintTrackingHook(
+    Handle<Object> value, Expression* expr) {
+  Handle<Object> node_label;
+  if (GenerateTaintTrackingPrepare(expr, &node_label) ==
+      tainttracking::Status::FAILURE) {
+    return;
+  }
+
+  Comment cmnt(masm_, "[ CallRuntime Taint Tracking Hook Handle");
+  PushOperand(value);
+  GenerateTaintTrackingBody(
+      node_label, tainttracking::CheckType::EXPRESSION_AFTER);
+}
+
+void FullCodeGenerator::GenerateTaintTrackingHookImmediate(
+    bool value, Expression* expr) {
+  Handle<Object> node_label;
+  if (GenerateTaintTrackingPrepare(expr, &node_label) ==
+      tainttracking::Status::FAILURE) {
+    return;
+  }
+
+  Comment cmnt(masm_, "[ CallRuntime Taint Tracking Hook Bool");
+  auto* fact = isolate_->factory();
+  PushOperand(value ? fact->true_value() : fact->false_value());
+  GenerateTaintTrackingBody(
+      node_label, tainttracking::CheckType::EXPRESSION_AFTER);
+}
+
+void FullCodeGenerator::GenerateTaintTrackingHookTOS(Expression* expr) {
+  Handle<Object> node_label;
+  if (GenerateTaintTrackingPrepare(expr, &node_label) ==
+      tainttracking::Status::FAILURE) {
+    return;
+  }
+
+  Comment cmnt(masm_, "[ CallRuntime Taint Tracking Hook Stack");
+  __ movp(result_register(), Operand(rsp, 0));
+  PushOperand(result_register());
+  GenerateTaintTrackingBody(
+      node_label,
+      tainttracking::CheckType::EXPRESSION_AFTER);
+
+}
+
+void FullCodeGenerator::GenerateTaintTrackingHookVariable(
+    Variable* var, Expression* expr) {
+  Handle<Object> node_label;
+  if (GenerateTaintTrackingPrepare(expr, &node_label) ==
+      tainttracking::Status::FAILURE) {
+    return;
+  }
+
+  Comment cmnt(masm_, "[ CallRuntime Taint Tracking Hook Variable");
+  PushOperand(VarOperand(var, result_register()));
+  GenerateTaintTrackingBody(
+      node_label,
+      tainttracking::CheckType::EXPRESSION_AFTER);
+}
+
+
+void FullCodeGenerator::GenerateTaintTrackingHookVariableLoad(
+    Register reg, VariableProxy* expr) {
+  Handle<Object> node_label;
+  if (GenerateTaintTrackingPrepare(expr, &node_label) ==
+      tainttracking::Status::FAILURE) {
+    return;
+  }
+
+  Variable* var = expr->var();
+  tainttracking::CheckType checktype;
+
+  PushOperand(reg);
+  PushOperand(node_label);
+  switch (var->location()) {
+    case VariableLocation::GLOBAL:
+    case VariableLocation::UNALLOCATED: {
+      PushOperand(handle(isolate_->heap()->undefined_value(), isolate_));
+      checktype = tainttracking::CheckType::EXPRESSION_VARIABLE_LOAD_GLOBAL;
+      break;
+    }
+
+    case VariableLocation::PARAMETER:
+      PushOperand(Smi::FromInt(var->index()));
+      checktype = tainttracking::CheckType::EXPRESSION_PARAMETER_LOAD;
+      break;
+
+    case VariableLocation::LOCAL:
+    case VariableLocation::CONTEXT: {
+      PushOperand(SymbolicStateForVar(var, reg));
+      checktype = tainttracking::CheckType::EXPRESSION_VARIABLE_LOAD;
+      break;
+    }
+
+    case VariableLocation::LOOKUP: {
+      PushOperand(handle(isolate_->heap()->undefined_value(), isolate_));
+      checktype =
+        tainttracking::CheckType::EXPRESSION_VARIABLE_LOAD_CONTEXT_LOOKUP;
+      break;
+    }
+
+    default:
+      UNREACHABLE();
+  }
+
+  PushOperand(Smi::FromInt(static_cast<uint32_t>(checktype)));
+
+  const Runtime::Function* check = Runtime::FunctionForId(
+      Runtime::kTaintTrackingLoadVariable);
+  // Call the C runtime function.
+  __ CallRuntime(check, check->nargs);
+  OperandStackDepthDecrement(check->nargs);
+}
+
+void FullCodeGenerator::GenerateTaintTrackingHookMemoryStorage(
+    Register concrete,
+    Handle<Object> expr_label,
+    tainttracking::CheckType checktype,
+    int parameter_var_idx) {
+  DCHECK(expr_label->IsSeqOneByteString());
+
+  int nargs = 3;
+  PushOperand(concrete);
+  PushOperand(expr_label);
+  PushOperand(Smi::FromInt(static_cast<uint32_t>(checktype)));
+  if (checktype == tainttracking::CheckType::EXPRESSION_PARAMETER_STORE) {
+    DCHECK_LE(0, parameter_var_idx);
+    PushOperand(Smi::FromInt(parameter_var_idx));
+    nargs += 1;
+  }
+  const Runtime::Function* check = Runtime::FunctionForId(
+      Runtime::kTaintTrackingStoreVariable);
+  // Call the C runtime function.
+  __ CallRuntime(check, nargs);
+  OperandStackDepthDecrement(nargs);
+}
+
+void FullCodeGenerator::GenerateTaintTrackingHookMemoryStorage(
+    Register concrete,
+    Expression* expr,
+    tainttracking::CheckType checktype) {
+  Handle<Object> label;
+  if (!GenerateTaintTrackingPrepare(expr, &label)) {
+    return;
+  }
+
+  DCHECK(expr->GetTaintTrackingLabel().IsValid());
+  DCHECK(label->IsSeqOneByteString());
+
+  GenerateTaintTrackingHookMemoryStorage(concrete, label, checktype);
+}
+
+
+int FullCodeGenerator::GenerateTaintStackSlotMultiplier() {
+  return (tainttracking::TaintTracker::FromIsolate(isolate())->
+          IsRewriteAstEnabled()) ? 2 : 1;
+}
+
+void FullCodeGenerator::GenerateTaintTrackingHookMemoryContextStorage(
+    Register concrete,
+    Handle<Object> label,
+    Register context,
+    int index) {
+  PushOperand(concrete);
+  PushOperand(label);
+  PushOperand(context);
+  PushOperand(Smi::FromInt(index));
+  const Runtime::Function* check = Runtime::FunctionForId(
+      Runtime::kTaintTrackingStoreContextVariable);
+  // Call the C runtime function.
+  __ CallRuntime(check, check->nargs);
+  OperandStackDepthDecrement(check->nargs);
+}
+
+void FullCodeGenerator::GenerateTaintTrackingHookParameterToContextStorage(
+    int parameter_index,
+    int context_slot_index,
+    Register context) {
+  if (!tainttracking::TaintTracker::FromIsolate(isolate_)->
+      IsRewriteAstEnabled()) {
+    return;
+  }
+
+  PushOperand(rax);
+  PushOperand(rsi);
+
+  PushOperand(Smi::FromInt(parameter_index));
+  PushOperand(Smi::FromInt(context_slot_index));
+  PushOperand(context);
+  const Runtime::Function* check = Runtime::FunctionForId(
+      Runtime::kTaintTrackingParameterToContextStorage);
+  // Call the C runtime function.
+  DCHECK_EQ(3, check->nargs);
+  __ CallRuntime(check, check->nargs);
+  OperandStackDepthDecrement(check->nargs);
+
+  PopOperand(rsi);
+  PopOperand(rax);
+}
+
+void FullCodeGenerator::GenerateTaintTrackingEnterFrame(Call* caller) {
+  #ifdef DEBUG
+  if (caller) {
+    caller->symbolized_enter_is_recorded_ = true;
+  }
+  #endif
+
+
+  if (!tainttracking::TaintTracker::FromIsolate(isolate_)->
+      IsRewriteAstEnabled()) {
+    return;
+  }
+
+  const Runtime::Function* check = Runtime::FunctionForId(
+      Runtime::kTaintTrackingEnterFrame);
+  __ CallRuntime(check, check->nargs);
+  OperandStackDepthDecrement(check->nargs);
+}
+
+void FullCodeGenerator::GenerateTaintTrackingPrepareFrame(
+    tainttracking::FrameType frame_type) {
+  if (!tainttracking::TaintTracker::FromIsolate(isolate_)->
+      IsRewriteAstEnabled()) {
+    return;
+  }
+
+  PushOperand(Smi::FromInt(static_cast<int>(frame_type)));
+  const Runtime::Function* check = Runtime::FunctionForId(
+      Runtime::kTaintTrackingPrepareFrame);
+  __ CallRuntime(check, check->nargs);
+  OperandStackDepthDecrement(check->nargs);
+}
+
+void FullCodeGenerator::GenerateTaintTrackingExitFrame() {
+  if (!tainttracking::TaintTracker::FromIsolate(isolate_)->
+      IsRewriteAstEnabled()) {
+    return;
+  }
+
+  PushOperand(rax);
+  const Runtime::Function* check = Runtime::FunctionForId(
+      Runtime::kTaintTrackingExitStackFrame);
+  __ CallRuntime(check, check->nargs);
+  OperandStackDepthDecrement(check->nargs);
+  PopOperand(rax);
+}
+
+void FullCodeGenerator::GenerateTaintTrackingAddArgument(
+    Expression* expr, Call* caller) {
+
+  #ifdef DEBUG
+  if (caller) {
+    caller->symbolized_args_++;
+  }
+  #endif
+
+  Handle<Object> node_label;
+  if (GenerateTaintTrackingPrepare(expr, &node_label) ==
+      tainttracking::Status::FAILURE) {
+    return;
+  }
+
+  PushOperand(node_label);
+  const Runtime::Function* check = Runtime::FunctionForId(
+      Runtime::kTaintTrackingAddArgumentToFrame);
+  __ CallRuntime(check, check->nargs);
+  OperandStackDepthDecrement(check->nargs);
+}
+
+void FullCodeGenerator::GenerateTaintTrackingHookSetReturn(
+    Register reg, AstNode* stmt) {
+  if (!tainttracking::TaintTracker::FromIsolate(isolate_)->
+      IsRewriteAstEnabled()) {
+    return;
+  }
+
+  PushOperand(reg);
+  PushOperand(reg);
+  Handle<Object> optional_label;
+  int nargs = 1;
+  if (stmt && node_label_serializer_.Serialize(
+          &optional_label, stmt->GetTaintTrackingLabel())) {
+    PushOperand(optional_label);
+    nargs += 1;
+  }
+  const Runtime::Function* check = Runtime::FunctionForId(
+      Runtime::kTaintTrackingSetReturnValue);
+  __ CallRuntime(check, nargs);
+  OperandStackDepthDecrement(nargs);
+  PopOperand(reg);
+}
+
+void FullCodeGenerator::GenerateTaintTrackingHookExitTry(
+    AstNode* stmt) {
+  Handle<Object> label;
+  if (!GenerateTaintTrackingPrepare(stmt, &label)) {
+    return;
+  }
+
+  PushOperand(label);
+  const Runtime::Function* check = Runtime::FunctionForId(
+      Runtime::kTaintTrackingExitTry);
+  __ CallRuntime(check, check->nargs);
+  OperandStackDepthDecrement(check->nargs);
+}
+
+void FullCodeGenerator::GenerateTaintTrackingHookEnterTry(
+    AstNode* stmt) {
+  Handle<Object> label;
+  if (!GenerateTaintTrackingPrepare(stmt, &label)) {
+    return;
+  }
+
+  PushOperand(label);
+  const Runtime::Function* check = Runtime::FunctionForId(
+      Runtime::kTaintTrackingEnterTry);
+  __ CallRuntime(check, check->nargs);
+  OperandStackDepthDecrement(check->nargs);
+}
+
+void FullCodeGenerator::GenerateTaintTrackingHookExitFinally() {
+  if (!tainttracking::TaintTracker::FromIsolate(isolate_)->
+      IsRewriteAstEnabled()) {
+    return;
+  }
+
+  const Runtime::Function* check = Runtime::FunctionForId(
+      Runtime::kTaintTrackingExitFinally);
+  __ CallRuntime(check, check->nargs);
+  OperandStackDepthDecrement(check->nargs);
+}
+
+void FullCodeGenerator::GenerateTaintTrackingHookMemoryStorage(
+    Register concrete,
+    Expression* expr,
+    tainttracking::CheckType checktype,
+    Register property_holder) {
+  Handle<Object> expr_label;
+  if (!GenerateTaintTrackingPrepare(expr, &expr_label)) {
+    return;
+  }
+
+  static const int nargs = 4;
+  PushOperand(concrete);
+  PushOperand(expr_label);
+  PushOperand(Smi::FromInt(static_cast<uint32_t>(checktype)));
+  PushOperand(property_holder);
+  DCHECK_EQ(checktype, tainttracking::CheckType::EXPRESSION_PROPERTY_STORE);
+  const Runtime::Function* check = Runtime::FunctionForId(
+      Runtime::kTaintTrackingStoreVariable);
+  // Call the C runtime function.
+  __ CallRuntime(check, nargs);
+  OperandStackDepthDecrement(nargs);
+}
+
+void FullCodeGenerator::GenerateTaintTrackingHookReceiverTOS(
+    Expression* symbolic) {
+  Handle<Object> ref;
+  if (symbolic) {
+    if (!GenerateTaintTrackingPrepare(symbolic, &ref)) {
+      return;
+    }
+  } else {
+    if (!tainttracking::TaintTracker::FromIsolate(isolate_)->
+        IsRewriteAstEnabled()) {
+      return;
+    }
+    ref = handle(isolate_->heap()->undefined_value(), isolate_);
+  }
+
+  PushOperand(rax);
+
+  PushOperand(Operand(rsp, 0));
+  GenerateTaintTrackingHookReceiverBody(ref);
+}
+
+void FullCodeGenerator::GenerateTaintTrackingHookReceiver(
+    Register literal, Expression* symbolic) {
+  Handle<Object> ref;
+  if (!GenerateTaintTrackingPrepare(symbolic, &ref)) {
+    return;
+  }
+
+  PushOperand(rax);
+
+  PushOperand(literal);
+  GenerateTaintTrackingHookReceiverBody(ref);
+}
+
+void FullCodeGenerator::GenerateTaintTrackingHookReceiverBody(
+    Handle<Object> label_value) {
+  PushOperand(label_value);
+  const Runtime::Function* check = Runtime::FunctionForId(
+      Runtime::kTaintTrackingAddReceiver);
+  __ CallRuntime(check, check->nargs);
+  OperandStackDepthDecrement(check->nargs);
+
+  PopOperand(rax);
+}
+
+void FullCodeGenerator::GenerateTaintTrackingMessageOriginCheck(
+    Token::Value op) {
+  if (!FLAG_taint_tracking_enable_message_origin_check) {
+    return;
+  }
+
+  switch (op) {
+    case Token::Value::EQ:
+    case Token::Value::NE:
+    case Token::Value::EQ_STRICT:
+    case Token::Value::NE_STRICT:
+      break;
+
+    default:
+      return;
+  }
+
+
+  PushOperand(rax);
+
+  PushOperand(Operand(rsp, kPointerSize)); // Left operand
+  PushOperand(rax);             // Right operand
+  PushOperand(Smi::FromInt(static_cast<int>(op)));
+  const Runtime::Function* check = Runtime::FunctionForId(
+      Runtime::kTaintTrackingCheckMessageOrigin);
+  __ CallRuntime(check, check->nargs);
+  OperandStackDepthDecrement(check->nargs);
+
+  PopOperand(rax);
+}
 
 #undef __
 

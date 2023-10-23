@@ -897,7 +897,11 @@ RUNTIME_FUNCTION_RETURN_PAIR(Runtime_LoadLookupSlotForCall) {
 
 namespace {
 
-MaybeHandle<Object> StoreLookupSlot(Handle<String> name, Handle<Object> value,
+static const int UNINITIALIZED = -2;
+
+MaybeHandle<Object> StoreLookupSlot(Handle<String> name,
+                                    Handle<Object> value,
+                                    MaybeHandle<Object> label,
                                     LanguageMode language_mode) {
   Isolate* const isolate = name->GetIsolate();
   Handle<Context> context(isolate->context(), isolate);
@@ -906,8 +910,18 @@ MaybeHandle<Object> StoreLookupSlot(Handle<String> name, Handle<Object> value,
   PropertyAttributes attributes;
   InitializationFlag flag;
   VariableMode mode;
-  Handle<Object> holder =
+  int symbolic_index = UNINITIALIZED;
+  Handle<Object> holder;
+
+  if (!label.is_null()) {
+    holder =
+      context->Lookup(name, FOLLOW_CHAINS, &index, &attributes, &flag, &mode,
+                      &symbolic_index);
+  } else {
+    holder =
       context->Lookup(name, FOLLOW_CHAINS, &index, &attributes, &flag, &mode);
+  }
+
   if (holder.is_null()) {
     // In case of JSProxy, an exception might have been thrown.
     if (isolate->has_pending_exception()) return MaybeHandle<Object>();
@@ -922,7 +936,14 @@ MaybeHandle<Object> StoreLookupSlot(Handle<String> name, Handle<Object> value,
                       Object);
     }
     if ((attributes & READ_ONLY) == 0) {
-      Handle<Context>::cast(holder)->set(index, *value);
+      Handle<Context> holder_as_ctx = Handle<Context>::cast(holder);
+      holder_as_ctx->set(index, *value);
+      Handle<Object> next_label;
+      if (label.ToHandle(&next_label)) {
+        if (symbolic_index != UNINITIALIZED) {
+          holder_as_ctx->set(symbolic_index, *next_label);
+        }
+      }
     } else if (is_strict(language_mode)) {
       // Setting read only property in strict mode.
       THROW_NEW_ERROR(isolate,
@@ -959,19 +980,38 @@ MaybeHandle<Object> StoreLookupSlot(Handle<String> name, Handle<Object> value,
 
 RUNTIME_FUNCTION(Runtime_StoreLookupSlot_Sloppy) {
   HandleScope scope(isolate);
-  DCHECK_EQ(2, args.length());
   CONVERT_ARG_HANDLE_CHECKED(String, name, 0);
   CONVERT_ARG_HANDLE_CHECKED(Object, value, 1);
-  RETURN_RESULT_OR_FAILURE(isolate, StoreLookupSlot(name, value, SLOPPY));
+  if (args.length() == 3) {
+    CONVERT_ARG_HANDLE_CHECKED(Object, label, 2);
+    RETURN_RESULT_OR_FAILURE(
+        isolate,
+        StoreLookupSlot(name, value, label, SLOPPY));
+  } else {
+    DCHECK(2 == args.length());
+    RETURN_RESULT_OR_FAILURE(
+        isolate,
+        StoreLookupSlot(name, value, MaybeHandle<Object>(), SLOPPY));
+  }
 }
 
 
 RUNTIME_FUNCTION(Runtime_StoreLookupSlot_Strict) {
   HandleScope scope(isolate);
-  DCHECK_EQ(2, args.length());
+  DCHECK(2 == args.length() || 3 == args.length());
   CONVERT_ARG_HANDLE_CHECKED(String, name, 0);
   CONVERT_ARG_HANDLE_CHECKED(Object, value, 1);
-  RETURN_RESULT_OR_FAILURE(isolate, StoreLookupSlot(name, value, STRICT));
+  if (args.length() == 3) {
+    CONVERT_ARG_HANDLE_CHECKED(Object, label, 2);
+    RETURN_RESULT_OR_FAILURE(
+        isolate,
+        StoreLookupSlot(name, value, label, STRICT));
+  } else {
+    DCHECK(2 == args.length());
+    RETURN_RESULT_OR_FAILURE(
+        isolate,
+        StoreLookupSlot(name, value, MaybeHandle<Object>(), STRICT));
+  }
 }
 
 }  // namespace internal

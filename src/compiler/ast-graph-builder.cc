@@ -435,7 +435,8 @@ AstGraphBuilder::AstGraphBuilder(Zone* local_zone, CompilationInfo* info,
                          local_zone),
       frame_state_function_info_(common()->CreateFrameStateFunctionInfo(
           FrameStateType::kJavaScriptFunction, info->num_parameters() + 1,
-          info->scope()->num_stack_slots(), info->shared_info())) {
+          info->scope()->num_stack_slots(), info->shared_info())),
+      node_label_serializer_(isolate_) {
   InitializeAstVisitor(info->isolate());
 }
 
@@ -1562,6 +1563,7 @@ void AstGraphBuilder::VisitFunctionLiteral(FunctionLiteral* expr) {
   PretenureFlag pretenure = expr->pretenure() ? TENURED : NOT_TENURED;
   const Operator* op = javascript()->CreateClosure(shared_info, pretenure);
   Node* value = NewNode(op);
+  BuildTaintTrackingHook(value, expr);
   ast_context()->ProduceValue(expr, value);
 }
 
@@ -1663,6 +1665,7 @@ void AstGraphBuilder::VisitClassLiteral(ClassLiteral* expr) {
     BuildVariableAssignment(var, literal, Token::INIT, feedback,
                             BailoutId::None());
   }
+  BuildTaintTrackingHook(literal, expr);
   ast_context()->ProduceValue(expr, literal);
 }
 
@@ -1675,7 +1678,9 @@ void AstGraphBuilder::VisitNativeFunctionLiteral(NativeFunctionLiteral* expr) {
 void AstGraphBuilder::VisitDoExpression(DoExpression* expr) {
   VisitBlock(expr->block());
   VisitVariableProxy(expr->result());
-  ast_context()->ReplaceValue(expr);
+  Node* value = ast_context()->ConsumeValue();
+  BuildTaintTrackingHook(value, expr);
+  ast_context()->ProduceValue(expr, value);
 }
 
 
@@ -1693,7 +1698,10 @@ void AstGraphBuilder::VisitConditional(Conditional* expr) {
   // sync with full codegen which doesn't prepare the proper bailout point (see
   // the implementation of FullCodeGenerator::VisitForControl).
   if (ast_context()->IsTest()) return;
-  ast_context()->ReplaceValue(expr);
+
+  Node* value = ast_context()->ConsumeValue();
+  BuildTaintTrackingHook(value, expr);
+  ast_context()->ProduceValue(expr, value);
 }
 
 
@@ -1702,12 +1710,14 @@ void AstGraphBuilder::VisitVariableProxy(VariableProxy* expr) {
   PrepareEagerCheckpoint(BeforeId(expr));
   Node* value = BuildVariableLoad(expr->var(), expr->id(), pair,
                                   ast_context()->GetStateCombine());
+  BuildTaintTrackingHook(value, expr);
   ast_context()->ProduceValue(expr, value);
 }
 
 
 void AstGraphBuilder::VisitLiteral(Literal* expr) {
   Node* value = jsgraph()->Constant(expr->value());
+  BuildTaintTrackingHook(value, expr);
   ast_context()->ProduceValue(expr, value);
 }
 
@@ -1719,6 +1729,7 @@ void AstGraphBuilder::VisitRegExpLiteral(RegExpLiteral* expr) {
   const Operator* op = javascript()->CreateLiteralRegExp(
       expr->pattern(), expr->flags(), expr->literal_index());
   Node* literal = NewNode(op, closure);
+  BuildTaintTrackingHook(literal, expr);
   PrepareFrameState(literal, expr->id(), ast_context()->GetStateCombine());
   ast_context()->ProduceValue(expr, literal);
 }
@@ -1909,7 +1920,9 @@ void AstGraphBuilder::VisitObjectLiteral(ObjectLiteral* expr) {
     }
   }
 
-  ast_context()->ProduceValue(expr, environment()->Pop());
+  Node* retval = environment()->Pop();
+  BuildTaintTrackingHook(retval, expr);
+  ast_context()->ProduceValue(expr, retval);
 }
 
 
@@ -1977,7 +1990,9 @@ void AstGraphBuilder::VisitArrayLiteral(ArrayLiteral* expr) {
     }
   }
 
-  ast_context()->ProduceValue(expr, environment()->Pop());
+  Node* retval = environment()->Pop();
+  BuildTaintTrackingHook(retval, expr);
+  ast_context()->ProduceValue(expr, retval);
 }
 
 void AstGraphBuilder::VisitForInAssignment(Expression* expr, Node* value,
@@ -2201,6 +2216,7 @@ void AstGraphBuilder::VisitAssignment(Assignment* expr) {
     }
   }
 
+  BuildTaintTrackingHook(value, expr);
   ast_context()->ProduceValue(expr, value);
 }
 
@@ -2451,6 +2467,7 @@ void AstGraphBuilder::VisitCall(Call* expr) {
   environment()->Push(value->InputAt(0));  // The callee passed to the call.
   PrepareFrameState(value, expr->ReturnId(), OutputFrameStateCombine::Push());
   environment()->Drop(1);
+  BuildTaintTrackingHook(value, expr);
   ast_context()->ProduceValue(expr, value);
 }
 
@@ -2499,6 +2516,7 @@ void AstGraphBuilder::VisitCallNew(CallNew* expr) {
       javascript()->CallConstruct(args->length() + 2, feedback);
   Node* value = ProcessArguments(call, args->length() + 2);
   PrepareFrameState(value, expr->ReturnId(), OutputFrameStateCombine::Push());
+  BuildTaintTrackingHook(value, expr);
   ast_context()->ProduceValue(expr, value);
 }
 
@@ -2544,12 +2562,28 @@ void AstGraphBuilder::VisitCallRuntime(CallRuntime* expr) {
     PrepareEagerCheckpoint(expr->CallId());
   }
   Node* value = ProcessArguments(call, args->length());
+  BuildTaintTrackingHook(value, expr);
   PrepareFrameState(value, expr->id(), ast_context()->GetStateCombine());
   ast_context()->ProduceValue(expr, value);
 }
 
 
 void AstGraphBuilder::VisitUnaryOperation(UnaryOperation* expr) {
+  if (tainttracking::TaintTracker::FromIsolate(isolate_)->
+      IsRewriteAstEnabled()) {
+    {
+      AstValueContext for_value(this);
+      BuildUnaryOperation(expr);
+    }
+    Node* value = environment()->Pop();
+    BuildTaintTrackingHook(value, expr);
+    ast_context()->ProduceValue(expr, value);
+  } else {
+    BuildUnaryOperation(expr);
+  }
+}
+
+void AstGraphBuilder::BuildUnaryOperation(UnaryOperation* expr) {
   switch (expr->op()) {
     case Token::DELETE:
       return VisitDelete(expr);
@@ -2722,6 +2756,7 @@ void AstGraphBuilder::VisitCountOperation(CountOperation* expr) {
   // Restore old value for postfix expressions.
   if (is_postfix) value = environment()->Pop();
 
+  BuildTaintTrackingHook(value, expr);
   ast_context()->ProduceValue(expr, value);
 }
 
@@ -2729,10 +2764,36 @@ void AstGraphBuilder::VisitCountOperation(CountOperation* expr) {
 void AstGraphBuilder::VisitBinaryOperation(BinaryOperation* expr) {
   switch (expr->op()) {
     case Token::COMMA:
-      return VisitComma(expr);
+      if (tainttracking::TaintTracker::FromIsolate(isolate())->
+          IsRewriteAstEnabled()) {
+        {
+          AstValueContext for_value(this);
+          VisitComma(expr);
+        }
+        Node* ret = environment()->Pop();
+        BuildTaintTrackingHook(ret, expr);
+        ast_context()->ProduceValue(expr, ret);
+      } else {
+        VisitComma(expr);
+      }
+      break;
+
     case Token::OR:
     case Token::AND:
-      return VisitLogicalExpression(expr);
+      if (tainttracking::TaintTracker::FromIsolate(isolate())->
+          IsRewriteAstEnabled()) {
+        {
+          AstValueContext for_value(this);
+          VisitLogicalExpression(expr);
+        }
+        Node* ret = environment()->Pop();
+        BuildTaintTrackingHook(ret, expr);
+        ast_context()->ProduceValue(expr, ret);
+      } else {
+        VisitLogicalExpression(expr);
+      }
+
+      break;
     default: {
       VisitForValue(expr->left());
       VisitForValue(expr->right());
@@ -2740,6 +2801,7 @@ void AstGraphBuilder::VisitBinaryOperation(BinaryOperation* expr) {
       Node* left = environment()->Pop();
       Node* value = BuildBinaryOp(left, right, expr->op(),
                                   expr->BinaryOperationFeedbackId());
+      BuildTaintTrackingHook(value, expr);
       PrepareFrameState(value, expr->id(), ast_context()->GetStateCombine());
       ast_context()->ProduceValue(expr, value);
     }
@@ -2779,6 +2841,21 @@ void AstGraphBuilder::VisitLiteralCompareTypeof(CompareOperation* expr,
 }
 
 void AstGraphBuilder::VisitCompareOperation(CompareOperation* expr) {
+  if (tainttracking::TaintTracker::FromIsolate(isolate())->
+      IsRewriteAstEnabled()) {
+    {
+      AstValueContext for_value(this);
+      BuildCompare(expr);
+    }
+    Node* ret = environment()->Pop();
+    BuildTaintTrackingHook(ret, expr);
+    ast_context()->ProduceValue(expr, ret);
+  } else {
+    BuildCompare(expr);
+  }
+}
+
+void AstGraphBuilder::BuildCompare(CompareOperation* expr) {
   // Check for a few fast cases. The AST visiting behavior must be in sync
   // with the full codegen: We don't push both left and right values onto
   // the expression stack when one side is a special-case literal.
@@ -2862,6 +2939,7 @@ void AstGraphBuilder::VisitEmptyParentheses(EmptyParentheses* expr) {
 
 void AstGraphBuilder::VisitThisFunction(ThisFunction* expr) {
   Node* value = GetFunctionClosure();
+  BuildTaintTrackingHook(value, expr);
   ast_context()->ProduceValue(expr, value);
 }
 
@@ -2953,6 +3031,7 @@ void AstGraphBuilder::VisitDelete(UnaryOperation* expr) {
     VisitForEffect(expr->expression());
     value = jsgraph()->TrueConstant();
   }
+  // BuildTaintTrackingHook(value, expr);
   ast_context()->ProduceValue(expr, value);
 }
 
@@ -2960,6 +3039,7 @@ void AstGraphBuilder::VisitDelete(UnaryOperation* expr) {
 void AstGraphBuilder::VisitVoid(UnaryOperation* expr) {
   VisitForEffect(expr->expression());
   Node* value = jsgraph()->UndefinedConstant();
+  // BuildTaintTrackingHook(value, expr);
   ast_context()->ProduceValue(expr, value);
 }
 
@@ -2982,6 +3062,7 @@ void AstGraphBuilder::VisitTypeofExpression(Expression* expr) {
 void AstGraphBuilder::VisitTypeof(UnaryOperation* expr) {
   VisitTypeofExpression(expr->expression());
   Node* value = NewNode(javascript()->TypeOf(), environment()->Pop());
+  // BuildTaintTrackingHook(value, expr);
   ast_context()->ProduceValue(expr, value);
 }
 
@@ -2991,6 +3072,7 @@ void AstGraphBuilder::VisitNot(UnaryOperation* expr) {
   Node* input = environment()->Pop();
   Node* value = NewNode(common()->Select(MachineRepresentation::kTagged), input,
                         jsgraph()->FalseConstant(), jsgraph()->TrueConstant());
+
   // Skip plugging AST evaluation contexts of the test kind. This is to stay in
   // sync with full codegen which doesn't prepare the proper bailout point (see
   // the implementation of FullCodeGenerator::VisitForControl).
@@ -4313,6 +4395,49 @@ Node* AstGraphBuilder::MergeValue(Node* value, Node* other, Node* control) {
     value->ReplaceInput(inputs - 1, other);
   }
   return value;
+}
+
+void AstGraphBuilder::BuildTaintTrackingHook(Node* input, Expression* expr) {
+  // TODO: Do this. Maybe Visit for effect?
+
+  if (!tainttracking::TaintTracker::FromIsolate(isolate_)->
+      IsRewriteAstEnabled()) {
+    return;
+  }
+
+
+  // First, push the arguments onto the environment
+  Handle<Object> label;
+  if (node_label_serializer_.Serialize(
+          &label,
+          expr->GetTaintTrackingLabel()) ==
+      tainttracking::Status::FAILURE) {
+    return;
+  }
+
+  AstEffectContext for_effect(this);
+
+  environment()->Push(input);
+  environment()->Push(jsgraph()->Constant(label));
+  environment()->Push(
+      jsgraph()->SmiConstant(
+          static_cast<uint32_t>(tainttracking::CheckType::EXPRESSION_AFTER)));
+
+  // Create node to perform the runtime call.
+  const Runtime::Function* check = Runtime::FunctionForId(
+      Runtime::kTaintTrackingHook);
+  const Operator* call = javascript()->CallRuntime(
+      Runtime::kTaintTrackingHook,
+      tainttracking::kRuntimeOnControlFlowExpArgs);
+  if (check->intrinsic_type == Runtime::IntrinsicType::RUNTIME ||
+      check->function_id == Runtime::kInlineCall) {
+    PrepareEagerCheckpoint(expr->id());
+  }
+
+  Node* value = ProcessArguments(
+      call, tainttracking::kRuntimeOnControlFlowExpArgs);
+  PrepareFrameState(value, expr->id(), ast_context()->GetStateCombine());
+  ast_context()->ProduceValue(expr, value);
 }
 
 }  // namespace compiler

@@ -431,7 +431,12 @@ RUNTIME_FUNCTION(Runtime_ResolvePossiblyDirectEval) {
   DCHECK(args[4]->IsSmi());
   Handle<SharedFunctionInfo> outer_info(args.at<JSFunction>(2)->shared(),
                                         isolate);
-  return CompileGlobalEval(isolate, args.at<String>(1), outer_info,
+  Handle<String> source = args.at<String>(1);
+
+  tainttracking::LogIfTainted(
+      source, tainttracking::TaintSinkLabel::JAVASCRIPT, 1);
+
+  return CompileGlobalEval(isolate, source, outer_info,
                            language_mode, args.smi_at(4), args.smi_at(5));
 }
 }  // namespace internal

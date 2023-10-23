@@ -77,6 +77,7 @@ void CompilerDispatcherJob::PrepareToParseOnMainThread() {
   parse_info_->set_end_position(shared->end_position());
   parse_info_->set_unicode_cache(unicode_cache_.get());
   parse_info_->set_language_mode(shared->language_mode());
+  parse_info_->set_function_token_position(shared->function_token_position());
 
   parser_.reset(new Parser(parse_info_.get()));
   parser_->DeserializeScopeChain(

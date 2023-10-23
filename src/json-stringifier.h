@@ -85,7 +85,7 @@ class JsonStringifier BASE_EMBEDDED {
 
   template <typename SrcChar, typename DestChar>
   INLINE(static void SerializeStringUnchecked_(
-      Vector<const SrcChar> src,
+      String* src,
       IncrementalStringBuilder::NoExtend<DestChar>* dest));
 
   template <typename SrcChar, typename DestChar>

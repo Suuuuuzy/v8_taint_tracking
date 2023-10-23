@@ -486,8 +486,9 @@ void CodeGenerator::AssembleSourcePosition(Instruction* instr) {
   current_source_position_ = source_position;
   if (source_position.IsUnknown()) return;
   int code_pos = source_position.raw();
-  source_position_table_builder_.AddPosition(masm()->pc_offset(), code_pos,
-                                             false);
+  source_position_table_builder_.AddPosition(
+      masm()->pc_offset(), code_pos,
+      false, SourcePositionTableBuilder::NO_TAINT_TRACKING_INDEX);
   if (FLAG_code_comments) {
     CompilationInfo* info = this->info();
     if (!info->parse_info()) return;

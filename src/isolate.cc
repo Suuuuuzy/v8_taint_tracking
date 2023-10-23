@@ -41,6 +41,8 @@
 #include "src/vm-state-inl.h"
 #include "src/wasm/wasm-module.h"
 
+#include "src/taint_tracking-inl.h"
+
 namespace v8 {
 namespace internal {
 
@@ -1042,6 +1044,18 @@ void Isolate::InvokeApiInterruptCallbacks() {
 void ReportBootstrappingException(Handle<Object> exception,
                                   MessageLocation* location) {
   base::OS::PrintError("Exception thrown during bootstrapping\n");
+
+
+  exception->Print(std::cerr);
+
+  char stack_trace [4000];
+    FixedStringAllocator alloc(stack_trace, sizeof(stack_trace));
+    StringStream stream(
+        &alloc, StringStream::ObjectPrintMode::kPrintObjectConcise);
+    Handle<HeapObject>::cast(exception)->GetIsolate()->PrintStack(&stream);
+
+    std::cerr  << stack_trace << std::endl;
+
   if (location == NULL || location->script().is_null()) return;
   // We are bootstrapping and caught an error where the location is set
   // and we have a script for the location.
@@ -1118,6 +1132,7 @@ Object* Isolate::Throw(Object* exception, MessageLocation* location) {
   // Notify debugger of exception.
   if (is_catchable_by_javascript(exception)) {
     debug()->OnThrow(exception_handle);
+    tainttracking::RuntimeOnThrow(this, exception_handle, false);
   }
 
   // Generate the message if required.
@@ -2016,7 +2031,9 @@ Isolate::Isolate(bool enable_serializer)
       use_counter_callback_(NULL),
       basic_block_profiler_(NULL),
       cancelable_task_manager_(new CancelableTaskManager()),
-      abort_on_uncaught_exception_callback_(NULL) {
+      abort_on_uncaught_exception_callback_(NULL),
+      taint_tracking_data_(
+          tainttracking::TaintTracker::New(enable_serializer, this)) {
   {
     base::LockGuard<base::Mutex> lock_guard(thread_data_table_mutex_.Pointer());
     CHECK(thread_data_table_);
@@ -2146,6 +2163,9 @@ void Isolate::Deinit() {
 
   delete heap_profiler_;
   heap_profiler_ = NULL;
+
+  tainttracking::LogDispose(this);
+  taint_tracking_data_.reset();
 
   heap_.TearDown();
   logger_->TearDown();
@@ -2498,6 +2518,10 @@ bool Isolate::Init(Deserializer* des) {
   initialized_from_snapshot_ = (des != NULL);
 
   if (!FLAG_inline_new) heap_.DisableInlineAllocation();
+
+  if (!serializer_enabled()) {
+    taint_tracking_data_->Initialize(this);
+  }
 
   return true;
 }
@@ -3170,6 +3194,10 @@ void Isolate::SetRAILMode(RAILMode rail_mode) {
   if (FLAG_trace_rail) {
     PrintIsolate(this, "RAIL mode: %s\n", RAILModeName(rail_mode));
   }
+}
+
+tainttracking::TaintTracker* Isolate::taint_tracking_data() {
+  return taint_tracking_data_.get();
 }
 
 bool StackLimitCheck::JsHasOverflowed(uintptr_t gap) const {

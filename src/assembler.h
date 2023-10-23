@@ -871,6 +871,7 @@ class ExternalReference BASE_EMBEDDED {
   ExternalReference(const Runtime::Function* f, Isolate* isolate);
 
   explicit ExternalReference(StatsCounter* counter);
+  explicit ExternalReference(tainttracking::InstanceCounter* counter);
 
   ExternalReference(Isolate::AddressId id, Isolate* isolate);
 

@@ -751,6 +751,24 @@ class Factory final {
 
   void SetStrictFunctionInstanceDescriptor(Handle<Map> map,
                                            FunctionMode function_mode);
+
+  MUST_USE_RESULT Handle<String> NewOneByteInternalizedSubStringHelper(
+    Handle<SeqOneByteString> string, int offset, int length,
+    uint32_t hash_field);
+
+  MUST_USE_RESULT Handle<String> NewInternalizedStringImplHelper(
+    Handle<String> string, int chars, uint32_t hash_field);
+
+  MUST_USE_RESULT Handle<String> NewInternalizedStringFromUtf8Helper(
+          Vector<const char> str, int chars, uint32_t hash_field);
+
+  MUST_USE_RESULT Handle<String> NewOneByteInternalizedStringHelper(
+      Vector<const uint8_t> str,
+      uint32_t hash_field);
+
+  MUST_USE_RESULT Handle<String> NewTwoByteInternalizedStringHelper(
+      Vector<const uc16> str,
+      uint32_t hash_field);
 };
 
 }  // namespace internal

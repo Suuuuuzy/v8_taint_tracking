@@ -6,6 +6,7 @@
 
 #include "src/macro-assembler.h"
 #include "src/snapshot/natives.h"
+#include "src/taint_tracking.h"
 
 namespace v8 {
 namespace internal {
@@ -367,6 +368,7 @@ void Serializer::ObjectSerializer::SerializeExternalString() {
   Map* map;
   int content_size;
   int allocation_size;
+  int taint_size = tainttracking::SizeForTaint(length);
   const byte* resource;
   // Find the map and size for the imaginary sequential string.
   bool internalized = object_->IsInternalizedString();
@@ -406,10 +408,14 @@ void Serializer::ObjectSerializer::SerializeExternalString() {
 
   // Serialize string content.
   sink_->PutRaw(resource, content_size, "StringContent");
+  byte taint_data[taint_size];
+  tainttracking::FlattenTaintData(string, taint_data, 0, taint_size);
+  sink_->PutRaw(taint_data, taint_size, "StringTaint");
 
   // Since the allocation size is rounded up to object alignment, there
   // maybe left-over bytes that need to be padded.
-  int padding_size = allocation_size - SeqString::kHeaderSize - content_size;
+  int padding_size = allocation_size -
+    SeqString::kHeaderSize - content_size - taint_size;
   DCHECK(0 <= padding_size && padding_size < kObjectAlignment);
   for (int i = 0; i < padding_size; i++) sink_->PutSection(0, "StringPadding");
 

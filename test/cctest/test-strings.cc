@@ -101,7 +101,8 @@ static const int DEEP_DEPTH = 8 * 1024;
 static const int SUPER_DEEP_DEPTH = 80 * 1024;
 
 
-class Resource: public v8::String::ExternalStringResource {
+class Resource: public v8::String::ExternalStringResource,
+                  public v8::String::TaintTrackingStringBufferImpl {
  public:
   Resource(const uc16* data, size_t length): data_(data), length_(length) {}
   ~Resource() { i::DeleteArray(data_); }
@@ -114,7 +115,8 @@ class Resource: public v8::String::ExternalStringResource {
 };
 
 
-class OneByteResource : public v8::String::ExternalOneByteStringResource {
+class OneByteResource : public v8::String::ExternalOneByteStringResource,
+                          public v8::String::TaintTrackingStringBufferImpl {
  public:
   OneByteResource(const char* data, size_t length)
       : data_(data), length_(length) {}
@@ -1146,7 +1148,9 @@ TEST(SliceFromCons) {
 }
 
 
-class OneByteVectorResource : public v8::String::ExternalOneByteStringResource {
+class OneByteVectorResource :
+  public v8::String::ExternalOneByteStringResource,
+  public v8::String::TaintTrackingStringBufferImpl {
  public:
   explicit OneByteVectorResource(i::Vector<const char> vector)
       : data_(vector) {}
@@ -1436,14 +1440,17 @@ TEST(Latin1IgnoreCase) {
 }
 
 
-class DummyResource: public v8::String::ExternalStringResource {
+class DummyResource: public v8::String::ExternalStringResource,
+                     public v8::String::TaintTrackingStringBufferImpl {
  public:
   virtual const uint16_t* data() const { return NULL; }
   virtual size_t length() const { return 1 << 30; }
 };
 
 
-class DummyOneByteResource: public v8::String::ExternalOneByteStringResource {
+class DummyOneByteResource:
+  public v8::String::ExternalOneByteStringResource,
+  public v8::String::TaintTrackingStringBufferImpl {
  public:
   virtual const char* data() const { return NULL; }
   virtual size_t length() const { return 1 << 30; }

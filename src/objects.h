@@ -155,6 +155,12 @@
 //  Smi:        [31 bit signed int] 0
 //  HeapObject: [32 bit direct pointer] (4 byte aligned) | 01
 
+namespace tainttracking {
+  inline int SizeForTaint(int length) {
+    return length * v8::internal::kCharSize;
+  }
+};
+
 namespace v8 {
 namespace internal {
 
@@ -1173,7 +1179,10 @@ class Object {
 
   // ES6 section 7.1.1 ToPrimitive
   MUST_USE_RESULT static inline MaybeHandle<Object> ToPrimitive(
-      Handle<Object> input, ToPrimitiveHint hint = ToPrimitiveHint::kDefault);
+      Handle<Object> input,
+      ToPrimitiveHint hint = ToPrimitiveHint::kDefault,
+      tainttracking::FrameType frame_type =
+        tainttracking::FrameType::UNKNOWN_CAPI);
 
   // ES6 section 7.1.3 ToNumber
   MUST_USE_RESULT static MaybeHandle<Object> ToNumber(Handle<Object> input);
@@ -1861,7 +1870,9 @@ class JSReceiver: public HeapObject {
   // ES6 section 7.1.1 ToPrimitive
   MUST_USE_RESULT static MaybeHandle<Object> ToPrimitive(
       Handle<JSReceiver> receiver,
-      ToPrimitiveHint hint = ToPrimitiveHint::kDefault);
+      ToPrimitiveHint hint = ToPrimitiveHint::kDefault,
+      tainttracking::FrameType frame_type =
+        tainttracking::FrameType::UNKNOWN_CAPI);
 
   // ES6 section 7.1.1.1 OrdinaryToPrimitive
   MUST_USE_RESULT static MaybeHandle<Object> OrdinaryToPrimitive(
@@ -4195,6 +4206,9 @@ class ScopeInfo : public FixedArray {
   // no contexts are allocated for this scope ContextLength returns 0.
   int ContextLength();
 
+  // Length without symbolic information
+  int ContextLengthWithoutTaint();
+
   // Does this scope declare a "this" binding?
   bool HasReceiver();
 
@@ -4258,6 +4272,9 @@ class ScopeInfo : public FixedArray {
   // present; otherwise returns a value < 0. The name must be an internalized
   // string.
   int StackSlotIndex(String* name);
+
+  // Return the symbolic information slot for the variable.
+  int SymbolicSlotFor(int var);
 
   // Lookup support for serialized scope info. Returns the local context slot
   // index for a given slot name if the slot is present; otherwise
@@ -5552,6 +5569,7 @@ class AbstractCode : public HeapObject {
   static const char* Kind2String(Kind kind);
 
   int SourcePosition(int offset);
+  int SourcePositionWithTaintTrackingAstIndex(int offset, int* ast_index);
   int SourceStatementPosition(int offset);
 
   // Returns the address of the first instruction.
@@ -7206,6 +7224,8 @@ class SharedFunctionInfo: public HeapObject {
   // Whether this function was created from a FunctionDeclaration.
   DECL_BOOLEAN_ACCESSORS(is_declaration)
 
+  DECL_ACCESSORS(taint_node_label, Object)
+
   inline FunctionKind kind();
   inline void set_kind(FunctionKind kind);
 
@@ -7318,8 +7338,10 @@ class SharedFunctionInfo: public HeapObject {
   static const int kScriptOffset = kFunctionDataOffset + kPointerSize;
   static const int kDebugInfoOffset = kScriptOffset + kPointerSize;
   static const int kFunctionIdentifierOffset = kDebugInfoOffset + kPointerSize;
-  static const int kFeedbackMetadataOffset =
+  static const int kTaintTrackingNodeLabel =
       kFunctionIdentifierOffset + kPointerSize;
+  static const int kFeedbackMetadataOffset =
+      kTaintTrackingNodeLabel + kPointerSize;
 #if TRACE_MAPS
   static const int kUniqueIdOffset = kFeedbackMetadataOffset + kPointerSize;
   static const int kLastPointerFieldOffset = kUniqueIdOffset;
@@ -8790,6 +8812,10 @@ class Name: public HeapObject {
 
   inline bool IsUniqueName() const;
 
+  static const int64_t DEFAULT_TAINT_INFO = 0;
+  inline int64_t taint_info() const;
+  inline void set_taint_info(int64_t);
+
   // Return a string version of this name that is converted according to the
   // rules described in ES6 section 9.2.11.
   MUST_USE_RESULT static MaybeHandle<String> ToFunctionName(Handle<Name> name);
@@ -8811,7 +8837,8 @@ class Name: public HeapObject {
 #else
   static const int kHashFieldOffset = kHashFieldSlot + kIntSize;
 #endif
-  static const int kSize = kHashFieldSlot + kPointerSize;
+  static const int kTaintInfoOffset = kHashFieldSlot + kPointerSize;
+  static const int kSize = kTaintInfoOffset + kInt64Size;
 
   // Mask constant for checking if a name has a computed hash code
   // and if it is a string that is an array index.  The least significant bit
@@ -9157,7 +9184,8 @@ class String: public Name {
   static const uc32 kMaxCodePoint = 0x10ffff;
 
   // Maximal string length.
-  static const int kMaxLength = (1 << 28) - 16;
+  // Modified to add more information for taints
+  static const int kMaxLength = (1 << 28) - 18;
 
   // Max length for computing hash. For strings longer than this limit the
   // string length is used as the hash value.
@@ -9303,6 +9331,8 @@ class SeqOneByteString: public SeqString {
   // Get the address of the characters in this string.
   inline Address GetCharsAddress();
 
+  inline byte* GetTaintChars();
+
   inline uint8_t* GetChars();
 
   DECLARE_CAST(SeqOneByteString)
@@ -9314,6 +9344,11 @@ class SeqOneByteString: public SeqString {
 
   // Computes the size for an OneByteString instance of a given length.
   static int SizeFor(int length) {
+    return OBJECT_POINTER_ALIGN(
+        kHeaderSize + length * kCharSize + tainttracking::SizeForTaint(length));
+  }
+
+  static int SizeForWithoutTaint(int length) {
     return OBJECT_POINTER_ALIGN(kHeaderSize + length * kCharSize);
   }
 
@@ -9339,6 +9374,8 @@ class SeqTwoByteString: public SeqString {
   // Get the address of the characters in this string.
   inline Address GetCharsAddress();
 
+  inline byte* GetTaintChars();
+
   inline uc16* GetChars();
 
   // For regexp code.
@@ -9353,6 +9390,11 @@ class SeqTwoByteString: public SeqString {
 
   // Computes the size for a TwoByteString instance of a given length.
   static int SizeFor(int length) {
+    return OBJECT_POINTER_ALIGN(kHeaderSize + length * kShortSize +
+                                tainttracking::SizeForTaint(length));
+  }
+
+  static int SizeForWithoutTaint(int length) {
     return OBJECT_POINTER_ALIGN(kHeaderSize + length * kShortSize);
   }
 
@@ -9497,7 +9539,7 @@ class ExternalOneByteString : public ExternalString {
   typedef v8::String::ExternalOneByteStringResource Resource;
 
   // The underlying resource.
-  inline const Resource* resource();
+  inline Resource* resource();
   inline void set_resource(const Resource* buffer);
 
   // Update the pointer cache to the external character array.
@@ -9529,7 +9571,7 @@ class ExternalTwoByteString: public ExternalString {
   typedef v8::String::ExternalStringResource Resource;
 
   // The underlying string resource.
-  inline const Resource* resource();
+  inline Resource* resource();
   inline void set_resource(const Resource* buffer);
 
   // Update the pointer cache to the external character array.

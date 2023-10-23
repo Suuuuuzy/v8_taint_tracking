@@ -117,6 +117,10 @@ void FullCodeGenerator::Generate() {
 
   { Comment cmnt(masm_, "[ Allocate locals");
     int locals_count = info->scope()->num_stack_slots();
+
+
+    locals_count *= GenerateTaintStackSlotMultiplier();
+
     // Generators allocate locals, if any, in context slots.
     DCHECK(!IsGeneratorFunction(info->literal()->kind()) || locals_count == 0);
     OperandStackDepthIncrement(locals_count);
@@ -162,6 +166,7 @@ void FullCodeGenerator::Generate() {
     Comment cmnt(masm_, "[ Allocate context");
     bool need_write_barrier = true;
     int slots = info->scope()->num_heap_slots() - Context::MIN_CONTEXT_SLOTS;
+
     // Argument to NewContext is the function, which is still in rdi.
     if (info->scope()->is_script_scope()) {
       __ Push(rdi);
@@ -214,6 +219,14 @@ void FullCodeGenerator::Generate() {
           __ Abort(kExpectedNewSpaceObject);
           __ bind(&done);
         }
+
+        #ifdef V8_TAINT_TRACKING_INCLUDE_CONCOLIC
+        GenerateTaintTrackingHookParameterToContextStorage(
+            i,
+            var->scope()->GetScopeInfo(isolate())->SymbolicSlotFor(
+                var->index()),
+            rsi);
+        #endif
       }
     }
   }
@@ -321,6 +334,7 @@ void FullCodeGenerator::Generate() {
   // the body.
   { Comment cmnt(masm_, "[ return <undefined>;");
     __ LoadRoot(rax, Heap::kUndefinedValueRootIndex);
+    GenerateTaintTrackingHookSetReturn(rax);
     EmitReturnSequence();
   }
 }
@@ -656,6 +670,33 @@ MemOperand FullCodeGenerator::VarOperand(Variable* var, Register scratch) {
     return ContextOperand(scratch, var->index());
   } else {
     return StackOperand(var);
+  }
+}
+
+MemOperand FullCodeGenerator::SymbolicStateForVar(
+    Variable* var, Register scratch) {
+  DCHECK(var->IsContextSlot() || var->IsStackAllocated());
+  if (var->IsContextSlot()) {
+    int context_chain_length = scope()->ContextChainLength(var->scope());
+    __ LoadContext(scratch, context_chain_length);
+    return ContextOperand(
+        scratch,
+        var
+        ->scope()
+        ->GetScopeInfo(isolate())
+        ->SymbolicSlotFor(var->index()));
+  } else {
+    DCHECK(var->IsStackAllocated());
+    DCHECK(!var->IsParameter());
+    // Offset is negative because higher indexes are at lower addresses.
+    int offset = -var->index() * kPointerSize;
+    // Adjust by a (parameter or local) base offset.
+    DCHECK_LT(0, info_->scope()->num_stack_slots());
+    DCHECK_GT(info_->scope()->num_stack_slots() *
+              GenerateTaintStackSlotMultiplier(), var->index());
+    offset -= info_->scope()->num_stack_slots() * kPointerSize;
+    offset += JavaScriptFrameConstants::kLocal0Offset;
+    return Operand(rbp, offset);
   }
 }
 
@@ -1260,6 +1301,7 @@ void FullCodeGenerator::EmitVariableLoad(VariableProxy* proxy,
     case VariableLocation::UNALLOCATED: {
       Comment cmnt(masm_, "[ Global variable");
       EmitGlobalVariableLoad(proxy, typeof_mode);
+      GenerateTaintTrackingHookVariableLoad(rax, proxy);
       context()->Plug(rax);
       break;
     }
@@ -1270,21 +1312,23 @@ void FullCodeGenerator::EmitVariableLoad(VariableProxy* proxy,
       DCHECK_EQ(NOT_INSIDE_TYPEOF, typeof_mode);
       Comment cmnt(masm_, var->IsContextSlot() ? "[ Context slot"
                                                : "[ Stack slot");
+      GetVar(rax, var);
       if (NeedsHoleCheckForLoad(proxy)) {
         // Throw a reference error when using an uninitialized let/const
         // binding in harmony mode.
         DCHECK(IsLexicalVariableMode(var->mode()));
         Label done;
-        GetVar(rax, var);
         __ CompareRoot(rax, Heap::kTheHoleValueRootIndex);
         __ j(not_equal, &done, Label::kNear);
         __ Push(var->name());
         __ CallRuntime(Runtime::kThrowReferenceError);
         __ bind(&done);
+        GenerateTaintTrackingHookVariableLoad(rax, proxy);
         context()->Plug(rax);
         break;
       }
-      context()->Plug(var);
+      GenerateTaintTrackingHookVariableLoad(rax, proxy);
+      context()->Plug(rax);
       break;
     }
 
@@ -1302,6 +1346,7 @@ void FullCodeGenerator::EmitVariableLoad(VariableProxy* proxy,
               : Runtime::kLoadLookupSlotInsideTypeof;
       __ CallRuntime(function_id);
       __ bind(&done);
+      GenerateTaintTrackingHookVariableLoad(rax, proxy);
       context()->Plug(rax);
       break;
     }
@@ -1357,7 +1402,16 @@ void FullCodeGenerator::VisitObjectLiteral(ObjectLiteral* expr) {
   for (; property_index < expr->properties()->length(); property_index++) {
     ObjectLiteral::Property* property = expr->properties()->at(property_index);
     if (property->is_computed_name()) break;
-    if (property->IsCompileTimeValue()) continue;
+
+    if (property->IsCompileTimeValue()) {
+      GenerateTaintTrackingHook(
+          tainttracking::ValueState::STATIC_VALUE,
+          property->key());
+      GenerateTaintTrackingHook(
+          tainttracking::ValueState::STATIC_VALUE,
+          property->value());
+      continue;
+    }
 
     Literal* key = property->key()->AsLiteral();
     Expression* value = property->value();
@@ -1375,6 +1429,9 @@ void FullCodeGenerator::VisitObjectLiteral(ObjectLiteral* expr) {
         // It is safe to use [[Put]] here because the boilerplate already
         // contains computed properties with an uninitialized value.
         if (key->value()->IsInternalizedString()) {
+          GenerateTaintTrackingHook(
+              tainttracking::ValueState::STATIC_VALUE, key);
+
           if (property->emit_store()) {
             VisitForAccumulatorValue(value);
             DCHECK(StoreDescriptor::ValueRegister().is(rax));
@@ -1406,6 +1463,8 @@ void FullCodeGenerator::VisitObjectLiteral(ObjectLiteral* expr) {
         }
         break;
       case ObjectLiteral::Property::PROTOTYPE:
+        GenerateTaintTrackingHook(
+            tainttracking::ValueState::STATIC_VALUE, key);
         PushOperand(Operand(rsp, 0));  // Duplicate receiver.
         VisitForStackValue(value);
         DCHECK(property->emit_store());
@@ -1511,8 +1570,10 @@ void FullCodeGenerator::VisitObjectLiteral(ObjectLiteral* expr) {
   }
 
   if (result_saved) {
+    GenerateTaintTrackingHookTOS(expr);
     context()->PlugTOS();
   } else {
+    GenerateTaintTrackingHook(rax, expr);
     context()->Plug(rax);
   }
 }
@@ -1560,7 +1621,11 @@ void FullCodeGenerator::VisitArrayLiteral(ArrayLiteral* expr) {
 
     // If the subexpression is a literal or a simple materialized literal it
     // is already set in the cloned array.
-    if (CompileTimeValue::IsCompileTimeValue(subexpr)) continue;
+    if (CompileTimeValue::IsCompileTimeValue(subexpr)) {
+      GenerateTaintTrackingHook(tainttracking::ValueState::STATIC_VALUE,
+                                subexpr);
+      continue;
+    }
 
     if (!result_saved) {
       PushOperand(rax);  // array literal
@@ -1601,8 +1666,10 @@ void FullCodeGenerator::VisitArrayLiteral(ArrayLiteral* expr) {
   }
 
   if (result_saved) {
+    GenerateTaintTrackingHookTOS(expr);
     context()->PlugTOS();
   } else {
+    GenerateTaintTrackingHook(rax, expr);
     context()->Plug(rax);
   }
 }
@@ -1620,15 +1687,31 @@ void FullCodeGenerator::VisitAssignment(Assignment* expr) {
   switch (assign_type) {
     case VARIABLE:
       // Nothing to do here.
+
+      GenerateTaintTrackingHook(
+          tainttracking::ValueState::LVALUE, expr->target());
+
       break;
     case NAMED_PROPERTY:
+      GenerateTaintTrackingHook(
+          tainttracking::ValueState::STATIC_VALUE, property->key());
+
       if (expr->is_compound()) {
         // We need the receiver both on the stack and in the register.
         VisitForStackValue(property->obj());
         __ movp(LoadDescriptor::ReceiverRegister(), Operand(rsp, 0));
+
+        PushOperand(LoadDescriptor::ReceiverRegister());
+        GenerateTaintTrackingHook(
+            tainttracking::ValueState::PROPERTY_LVALUE, expr->target());
+        PopOperand(LoadDescriptor::ReceiverRegister());
+
       } else {
         VisitForStackValue(property->obj());
+        GenerateTaintTrackingHook(
+            tainttracking::ValueState::PROPERTY_LVALUE, expr->target());
       }
+
       break;
     case NAMED_SUPER_PROPERTY:
       VisitForStackValue(
@@ -1640,6 +1723,9 @@ void FullCodeGenerator::VisitAssignment(Assignment* expr) {
         PushOperand(MemOperand(rsp, kPointerSize));
         PushOperand(result_register());
       }
+
+      GenerateTaintTrackingHook(
+          tainttracking::ValueState::PROPERTY_LVALUE, expr->target());
       break;
     case KEYED_SUPER_PROPERTY:
       VisitForStackValue(
@@ -1653,16 +1739,22 @@ void FullCodeGenerator::VisitAssignment(Assignment* expr) {
         PushOperand(MemOperand(rsp, 2 * kPointerSize));
         PushOperand(result_register());
       }
+      GenerateTaintTrackingHook(
+          tainttracking::ValueState::PROPERTY_LVALUE, expr->target());
       break;
     case KEYED_PROPERTY: {
       if (expr->is_compound()) {
         VisitForStackValue(property->obj());
         VisitForStackValue(property->key());
+        GenerateTaintTrackingHook(
+            tainttracking::ValueState::PROPERTY_LVALUE, expr->target());
         __ movp(LoadDescriptor::ReceiverRegister(), Operand(rsp, kPointerSize));
         __ movp(LoadDescriptor::NameRegister(), Operand(rsp, 0));
       } else {
         VisitForStackValue(property->obj());
         VisitForStackValue(property->key());
+        GenerateTaintTrackingHook(
+            tainttracking::ValueState::PROPERTY_LVALUE, expr->target());
       }
       break;
     }
@@ -1681,21 +1773,25 @@ void FullCodeGenerator::VisitAssignment(Assignment* expr) {
           EmitNamedPropertyLoad(property);
           PrepareForBailoutForId(property->LoadId(),
                                  BailoutState::TOS_REGISTER);
+          GenerateTaintTrackingHook(rax, expr->target());
           break;
         case NAMED_SUPER_PROPERTY:
           EmitNamedSuperPropertyLoad(property);
           PrepareForBailoutForId(property->LoadId(),
                                  BailoutState::TOS_REGISTER);
+          GenerateTaintTrackingHook(rax, expr->target());
           break;
         case KEYED_SUPER_PROPERTY:
           EmitKeyedSuperPropertyLoad(property);
           PrepareForBailoutForId(property->LoadId(),
                                  BailoutState::TOS_REGISTER);
+          GenerateTaintTrackingHook(rax, expr->target());
           break;
         case KEYED_PROPERTY:
           EmitKeyedPropertyLoad(property);
           PrepareForBailoutForId(property->LoadId(),
                                  BailoutState::TOS_REGISTER);
+          GenerateTaintTrackingHook(rax, expr->target());
           break;
       }
     }
@@ -1725,21 +1821,40 @@ void FullCodeGenerator::VisitAssignment(Assignment* expr) {
   switch (assign_type) {
     case VARIABLE:
       EmitVariableAssignment(expr->target()->AsVariableProxy()->var(),
-                             expr->op(), expr->AssignmentSlot());
+                             expr->op(),
+                             expr->AssignmentSlot(),
+                             expr);
       PrepareForBailoutForId(expr->AssignmentId(), BailoutState::TOS_REGISTER);
+      GenerateTaintTrackingHook(rax, expr);
       context()->Plug(rax);
       break;
     case NAMED_PROPERTY:
       EmitNamedPropertyAssignment(expr);
       break;
+
     case NAMED_SUPER_PROPERTY:
+      PushOperand(rax);
+      GenerateTaintTrackingHookMemoryStorage(
+          rax,
+          expr,
+          tainttracking::CheckType::EXPRESSION_PROPERTY_STORE);
+      PopOperand(rax);
+
       EmitNamedSuperPropertyStore(property);
+      GenerateTaintTrackingHook(rax, expr);
       context()->Plug(rax);
       break;
     case KEYED_SUPER_PROPERTY:
+      PushOperand(rax);
+      GenerateTaintTrackingHookMemoryStorage(
+          rax, expr, tainttracking::CheckType::EXPRESSION_PROPERTY_STORE);
+      PopOperand(rax);
+
       EmitKeyedSuperPropertyStore(property);
+      GenerateTaintTrackingHook(rax, expr);
       context()->Plug(rax);
       break;
+
     case KEYED_PROPERTY:
       EmitKeyedPropertyAssignment(expr);
       break;
@@ -1798,6 +1913,7 @@ void FullCodeGenerator::VisitYield(Yield* expr) {
   EmitReturnSequence();
 
   __ bind(&resume);
+  GenerateTaintTrackingHook(result_register(), expr);
   context()->Plug(result_register());
 }
 
@@ -1898,6 +2014,7 @@ void FullCodeGenerator::EmitInlineSmiBinaryOp(BinaryOperation* expr,
   }
 
   __ bind(&done);
+  GenerateTaintTrackingHook(rax, expr);
   context()->Plug(rax);
 }
 
@@ -1956,12 +2073,19 @@ void FullCodeGenerator::EmitClassDefineProperties(ClassLiteral* lit) {
 }
 
 
-void FullCodeGenerator::EmitBinaryOp(BinaryOperation* expr, Token::Value op) {
+void FullCodeGenerator::EmitBinaryOp(BinaryOperation* expr,
+                                     Token::Value op,
+                                     tainttracking::ValueState state) {
   PopOperand(rdx);
   Handle<Code> code = CodeFactory::BinaryOpIC(isolate(), op).code();
   JumpPatchSite patch_site(masm_);    // unbound, signals no inlined smi code.
   CallIC(code, expr->BinaryOperationFeedbackId());
   patch_site.EmitPatchInfo();
+
+  if (state == tainttracking::ValueState::ADD_HOOK) {
+    GenerateTaintTrackingHook(rax, expr);
+  }
+
   context()->Plug(rax);
 }
 
@@ -2047,18 +2171,51 @@ void FullCodeGenerator::EmitAssignment(Expression* expr,
 
 
 void FullCodeGenerator::EmitStoreToStackLocalOrContextSlot(
-    Variable* var, MemOperand location) {
+    Variable* var, MemOperand location, Expression* rhs) {
+  Handle<Object> label;
+  bool symbolic_enabled = rhs && (
+      GenerateTaintTrackingPrepare(rhs, &label));
+
   __ movp(location, rax);
   if (var->IsContextSlot()) {
     __ movp(rdx, rax);
     __ RecordWriteContextSlot(
         rcx, Context::SlotOffset(var->index()), rdx, rbx, kDontSaveFPRegs);
   }
+
+  if (symbolic_enabled) {
+    PushOperand(rax);
+    DCHECK(rhs->GetTaintTrackingLabel().IsValid());
+
+    if (var->IsParameter()) {
+      GenerateTaintTrackingHookMemoryStorage(
+          rax,
+          label,
+          tainttracking::CheckType::EXPRESSION_PARAMETER_STORE,
+          var->index());
+    } else if (var->IsContextSlot()) {
+      int context_chain_length = scope()->ContextChainLength(var->scope());
+      __ LoadContext(rcx, context_chain_length);
+
+      GenerateTaintTrackingHookMemoryContextStorage(
+          rax, label, rcx,
+          var->scope()->GetScopeInfo(isolate())->SymbolicSlotFor(var->index()));
+    } else {
+      DCHECK(var->IsStackAllocated() && !var->IsParameter());
+      GenerateTaintTrackingHookMemoryStorage(
+          rax, label, tainttracking::CheckType::EXPRESSION_VARIABLE_STORE);
+      __ movp(SymbolicStateForVar(var, rcx), rax);
+    }
+    // Loads a symbolic value into rax
+    PopOperand(rax);
+  }
 }
 
 
-void FullCodeGenerator::EmitVariableAssignment(Variable* var, Token::Value op,
-                                               FeedbackVectorSlot slot) {
+void FullCodeGenerator::EmitVariableAssignment(Variable* var,
+                                               Token::Value op,
+                                               FeedbackVectorSlot slot,
+                                               Expression* proxy) {
   if (var->IsUnallocated()) {
     // Global var, const, or let.
     __ Move(StoreDescriptor::NameRegister(), var->name());
@@ -2083,7 +2240,7 @@ void FullCodeGenerator::EmitVariableAssignment(Variable* var, Token::Value op,
     if (var->mode() == CONST) {
       __ CallRuntime(Runtime::kThrowConstAssignError);
     } else {
-      EmitStoreToStackLocalOrContextSlot(var, location);
+      EmitStoreToStackLocalOrContextSlot(var, location, proxy);
     }
 
   } else if (var->is_this() && var->mode() == CONST && op == Token::INIT) {
@@ -2097,16 +2254,27 @@ void FullCodeGenerator::EmitVariableAssignment(Variable* var, Token::Value op,
     __ Push(var->name());
     __ CallRuntime(Runtime::kThrowReferenceError);
     __ bind(&uninitialized_this);
-    EmitStoreToStackLocalOrContextSlot(var, location);
+    EmitStoreToStackLocalOrContextSlot(var, location, proxy);
 
   } else if (!var->is_const_mode() || op == Token::INIT) {
     if (var->IsLookupSlot()) {
       // Assignment to var.
       __ Push(var->name());
       __ Push(rax);
+
+      Handle<Object> label;
+      int nargs = 2;
+      bool push_label = proxy && (
+          GenerateTaintTrackingPrepare(proxy, &label) == tainttracking::OK);
+      // if (push_label) {
+      //   __ Push(label);
+      //   nargs = 3;
+      // }
       __ CallRuntime(is_strict(language_mode())
-                         ? Runtime::kStoreLookupSlot_Strict
-                         : Runtime::kStoreLookupSlot_Sloppy);
+                     ? Runtime::kStoreLookupSlot_Strict
+                     : Runtime::kStoreLookupSlot_Sloppy,
+                     nargs);
+
     } else {
       // Assignment to var or initializing assignment to let/const in harmony
       // mode.
@@ -2118,7 +2286,8 @@ void FullCodeGenerator::EmitVariableAssignment(Variable* var, Token::Value op,
         __ CompareRoot(rdx, Heap::kTheHoleValueRootIndex);
         __ Check(equal, kLetBindingReInitialization);
       }
-      EmitStoreToStackLocalOrContextSlot(var, location);
+      EmitStoreToStackLocalOrContextSlot(var, location, proxy);
+
     }
 
   } else {
@@ -2134,15 +2303,37 @@ void FullCodeGenerator::EmitVariableAssignment(Variable* var, Token::Value op,
 void FullCodeGenerator::EmitNamedPropertyAssignment(Assignment* expr) {
   // Assignment to a property, using a named store IC.
   Property* prop = expr->target()->AsProperty();
+
   DCHECK(prop != NULL);
   DCHECK(prop->key()->IsLiteral());
 
-  __ Move(StoreDescriptor::NameRegister(), prop->key()->AsLiteral()->value());
+
   PopOperand(StoreDescriptor::ReceiverRegister());
+
+  if (tainttracking::TaintTracker::FromIsolate(isolate_)->
+      IsRewriteAstEnabled()) {
+    // Save values
+    PushOperand(StoreDescriptor::ReceiverRegister());
+    PushOperand(rax);
+
+    GenerateTaintTrackingHookMemoryStorage(
+        rax,
+        expr,
+        tainttracking::CheckType::EXPRESSION_PROPERTY_STORE,
+        StoreDescriptor::ReceiverRegister());
+
+    // Restore values
+    PopOperand(rax);
+    PopOperand(StoreDescriptor::ReceiverRegister());
+  }
+
+  __ Move(StoreDescriptor::NameRegister(), prop->key()->AsLiteral()->value());
+
   EmitLoadStoreICSlot(expr->AssignmentSlot());
   CallStoreIC();
 
   PrepareForBailoutForId(expr->AssignmentId(), BailoutState::TOS_REGISTER);
+  GenerateTaintTrackingHook(rax, expr);
   context()->Plug(rax);
 }
 
@@ -2180,6 +2371,26 @@ void FullCodeGenerator::EmitKeyedPropertyAssignment(Assignment* expr) {
   // Assignment to a property, using a keyed store IC.
   PopOperand(StoreDescriptor::NameRegister());  // Key.
   PopOperand(StoreDescriptor::ReceiverRegister());
+
+  if (tainttracking::TaintTracker::FromIsolate(isolate_)->
+      IsRewriteAstEnabled()) {
+    // Save values
+    PushOperand(StoreDescriptor::ReceiverRegister());
+    PushOperand(StoreDescriptor::NameRegister());
+    PushOperand(rax);
+
+    GenerateTaintTrackingHookMemoryStorage(
+        rax,
+        expr,
+        tainttracking::CheckType::EXPRESSION_PROPERTY_STORE,
+        StoreDescriptor::ReceiverRegister());
+
+    // Restore values
+    PopOperand(rax);
+    PopOperand(StoreDescriptor::NameRegister());
+    PopOperand(StoreDescriptor::ReceiverRegister());
+  }
+
   DCHECK(StoreDescriptor::ValueRegister().is(rax));
   Handle<Code> ic =
       CodeFactory::KeyedStoreIC(isolate(), language_mode()).code();
@@ -2187,6 +2398,7 @@ void FullCodeGenerator::EmitKeyedPropertyAssignment(Assignment* expr) {
   CallIC(ic);
 
   PrepareForBailoutForId(expr->AssignmentId(), BailoutState::TOS_REGISTER);
+  GenerateTaintTrackingHook(rax, expr);
   context()->Plug(rax);
 }
 
@@ -2219,6 +2431,7 @@ void FullCodeGenerator::EmitCallWithLoadIC(Call* expr) {
     DCHECK(!callee->AsProperty()->IsSuperAccess());
     __ movp(LoadDescriptor::ReceiverRegister(), Operand(rsp, 0));
     EmitNamedPropertyLoad(callee->AsProperty());
+    GenerateTaintTrackingHook(result_register(), callee);
     PrepareForBailoutForId(callee->AsProperty()->LoadId(),
                            BailoutState::TOS_REGISTER);
     // Push the target function under the receiver.
@@ -2249,6 +2462,7 @@ void FullCodeGenerator::EmitSuperCallWithLoadIC(Call* expr) {
   PushOperand(Operand(rsp, kPointerSize * 2));
   PushOperand(key->value());
 
+  GenerateTaintTrackingHookReceiver(rax, super_ref->this_var());
   // Stack here:
   //  - home_object
   //  - this (receiver)
@@ -2281,6 +2495,7 @@ void FullCodeGenerator::EmitKeyedCallWithLoadIC(Call* expr,
   __ movp(LoadDescriptor::ReceiverRegister(), Operand(rsp, 0));
   __ Move(LoadDescriptor::NameRegister(), rax);
   EmitKeyedPropertyLoad(callee->AsProperty());
+  GenerateTaintTrackingHook(rax, callee);
   PrepareForBailoutForId(callee->AsProperty()->LoadId(),
                          BailoutState::TOS_REGISTER);
 
@@ -2308,6 +2523,8 @@ void FullCodeGenerator::EmitKeyedSuperCallWithLoadIC(Call* expr) {
   PushOperand(Operand(rsp, kPointerSize * 2));
   VisitForStackValue(prop->key());
 
+  GenerateTaintTrackingHookReceiver(rax, super_ref->this_var());
+
   // Stack here:
   //  - home_object
   //  - this (receiver)
@@ -2333,10 +2550,14 @@ void FullCodeGenerator::EmitCall(Call* expr, ConvertReceiverMode mode) {
   int arg_count = args->length();
   for (int i = 0; i < arg_count; i++) {
     VisitForStackValue(args->at(i));
+    GenerateTaintTrackingAddArgument(args->at(i), expr);
   }
 
   PrepareForBailoutForId(expr->CallId(), BailoutState::NO_REGISTERS);
   SetCallPosition(expr, expr->tail_call_mode());
+
+  GenerateTaintTrackingEnterFrame(expr);
+
   if (expr->tail_call_mode() == TailCallMode::kAllow) {
     if (FLAG_trace) {
       __ CallRuntime(Runtime::kTraceTailCall);
@@ -2357,7 +2578,10 @@ void FullCodeGenerator::EmitCall(Call* expr, ConvertReceiverMode mode) {
 
   RecordJSReturnSite(expr);
   RestoreContext();
+  GenerateTaintTrackingExitFrame();
+
   // Discard the function left on TOS.
+  GenerateTaintTrackingHook(rax, expr);
   context()->DropAndPlug(1, rax);
 }
 
@@ -2403,6 +2627,12 @@ void FullCodeGenerator::PushCalleeAndWithBaseObject(Call* expr) {
     __ CallRuntime(Runtime::kLoadLookupSlotForCall);
     PushOperand(rax);  // Function.
     PushOperand(rdx);  // Receiver.
+
+    GenerateTaintTrackingHookVariableLoad(rax, callee);
+
+    // TODO: Must instrument dynamic lookups with symbolic values
+    GenerateTaintTrackingHookReceiverTOS(nullptr);
+
     PrepareForBailoutForId(expr->LookupId(), BailoutState::NO_REGISTERS);
 
     // If fast case code has been generated, emit code to push the function
@@ -2411,12 +2641,18 @@ void FullCodeGenerator::PushCalleeAndWithBaseObject(Call* expr) {
       Label call;
       __ jmp(&call, Label::kNear);
       __ bind(&done);
+
       // Push function.
       __ Push(rax);
+
+      GenerateTaintTrackingHookVariableLoad(rax, callee);
+
       // Pass undefined as the receiver, which is the WithBaseObject of a
       // non-object environment record.  If the callee is sloppy, it will patch
       // it up to be the global receiver.
       __ PushRoot(Heap::kUndefinedValueRootIndex);
+      GenerateTaintTrackingHookReceiverTOS(nullptr);
+
       __ bind(&call);
     }
   } else {
@@ -2424,6 +2660,7 @@ void FullCodeGenerator::PushCalleeAndWithBaseObject(Call* expr) {
     // refEnv.WithBaseObject()
     OperandStackDepthIncrement(1);
     __ PushRoot(Heap::kUndefinedValueRootIndex);
+    GenerateTaintTrackingHookReceiverTOS(nullptr);
   }
 }
 
@@ -2439,6 +2676,7 @@ void FullCodeGenerator::EmitPossiblyEvalCall(Call* expr) {
   // Push the arguments.
   for (int i = 0; i < arg_count; i++) {
     VisitForStackValue(args->at(i));
+    GenerateTaintTrackingAddArgument(args->at(i), expr);
   }
 
   // Push a copy of the function (found below the arguments) and resolve
@@ -2448,6 +2686,8 @@ void FullCodeGenerator::EmitPossiblyEvalCall(Call* expr) {
 
   // Touch up the callee.
   __ movp(Operand(rsp, (arg_count + 1) * kPointerSize), rax);
+
+  GenerateTaintTrackingEnterFrame(expr);
 
   PrepareForBailoutForId(expr->EvalId(), BailoutState::NO_REGISTERS);
 
@@ -2460,6 +2700,9 @@ void FullCodeGenerator::EmitPossiblyEvalCall(Call* expr) {
   OperandStackDepthDecrement(arg_count + 1);
   RecordJSReturnSite(expr);
   RestoreContext();
+  GenerateTaintTrackingExitFrame();
+
+  GenerateTaintTrackingHook(rax, expr);
   context()->DropAndPlug(1, rax);
 }
 
@@ -2476,16 +2719,21 @@ void FullCodeGenerator::VisitCallNew(CallNew* expr) {
   DCHECK(!expr->expression()->IsSuperPropertyReference());
   VisitForStackValue(expr->expression());
 
+  GenerateTaintTrackingPrepareFrame(tainttracking::FrameType::JS_CALL_NEW);
+
   // Push the arguments ("left-to-right") on the stack.
   ZoneList<Expression*>* args = expr->arguments();
   int arg_count = args->length();
   for (int i = 0; i < arg_count; i++) {
     VisitForStackValue(args->at(i));
+    GenerateTaintTrackingAddArgument(args->at(i));
   }
 
   // Call the construct call builtin that handles allocation and
   // constructor invocation.
   SetConstructCallPosition(expr);
+
+  GenerateTaintTrackingEnterFrame();
 
   // Load function and argument count into rdi and rax.
   __ Set(rax, arg_count);
@@ -2500,6 +2748,9 @@ void FullCodeGenerator::VisitCallNew(CallNew* expr) {
   OperandStackDepthDecrement(arg_count + 1);
   PrepareForBailoutForId(expr->ReturnId(), BailoutState::TOS_REGISTER);
   RestoreContext();
+  GenerateTaintTrackingExitFrame();
+
+  GenerateTaintTrackingHook(rax, expr);
   context()->Plug(rax);
 }
 
@@ -2541,6 +2792,7 @@ void FullCodeGenerator::EmitSuperConstructorCall(Call* expr) {
 
   RecordJSReturnSite(expr);
   RestoreContext();
+  GenerateTaintTrackingHook(rax, expr);
   context()->Plug(rax);
 }
 
@@ -2551,6 +2803,8 @@ void FullCodeGenerator::EmitIsSmi(CallRuntime* expr) {
 
   VisitForAccumulatorValue(args->at(0));
 
+  Label hook_true;
+
   Label materialize_true, materialize_false;
   Label* if_true = NULL;
   Label* if_false = NULL;
@@ -2559,8 +2813,13 @@ void FullCodeGenerator::EmitIsSmi(CallRuntime* expr) {
                          &if_true, &if_false, &fall_through);
 
   PrepareForBailoutBeforeSplit(expr, true, if_true, if_false);
-  __ JumpIfSmi(rax, if_true);
+  __ JumpIfSmi(rax, &hook_true);
+  GenerateTaintTrackingHookImmediate(false, expr);
   __ jmp(if_false);
+
+  __ bind(&hook_true);
+  GenerateTaintTrackingHookImmediate(true, expr);
+  __ jmp(if_true);
 
   context()->Plug(if_true, if_false);
 }
@@ -2572,6 +2831,7 @@ void FullCodeGenerator::EmitIsJSReceiver(CallRuntime* expr) {
 
   VisitForAccumulatorValue(args->at(0));
 
+  Label hook_true, hook_false;
   Label materialize_true, materialize_false;
   Label* if_true = NULL;
   Label* if_false = NULL;
@@ -2579,10 +2839,18 @@ void FullCodeGenerator::EmitIsJSReceiver(CallRuntime* expr) {
   context()->PrepareTest(&materialize_true, &materialize_false,
                          &if_true, &if_false, &fall_through);
 
-  __ JumpIfSmi(rax, if_false);
+  __ JumpIfSmi(rax, &hook_false);
   __ CmpObjectType(rax, FIRST_JS_RECEIVER_TYPE, rbx);
   PrepareForBailoutBeforeSplit(expr, true, if_true, if_false);
-  Split(above_equal, if_true, if_false, fall_through);
+  Split(above_equal, &hook_true, &hook_false, &hook_true);
+
+  __ bind(&hook_true);
+  GenerateTaintTrackingHookImmediate(true, expr);
+  __ jmp(if_true);
+
+  __ bind(&hook_false);
+  GenerateTaintTrackingHookImmediate(false, expr);
+  __ jmp(if_false);
 
   context()->Plug(if_true, if_false);
 }
@@ -2594,6 +2862,7 @@ void FullCodeGenerator::EmitIsArray(CallRuntime* expr) {
 
   VisitForAccumulatorValue(args->at(0));
 
+  Label hook_true, hook_false;
   Label materialize_true, materialize_false;
   Label* if_true = NULL;
   Label* if_false = NULL;
@@ -2601,10 +2870,17 @@ void FullCodeGenerator::EmitIsArray(CallRuntime* expr) {
   context()->PrepareTest(&materialize_true, &materialize_false,
                          &if_true, &if_false, &fall_through);
 
-  __ JumpIfSmi(rax, if_false);
+  __ JumpIfSmi(rax, &hook_false);
   __ CmpObjectType(rax, JS_ARRAY_TYPE, rbx);
   PrepareForBailoutBeforeSplit(expr, true, if_true, if_false);
-  Split(equal, if_true, if_false, fall_through);
+  Split(equal, &hook_true, &hook_false, NULL);
+
+  __ bind(&hook_true);
+  GenerateTaintTrackingHookImmediate(true, expr);
+  __ jmp(if_true);
+  __ bind(&hook_false);
+  GenerateTaintTrackingHookImmediate(false, expr);
+  __ jmp(if_false);
 
   context()->Plug(if_true, if_false);
 }
@@ -2616,6 +2892,7 @@ void FullCodeGenerator::EmitIsTypedArray(CallRuntime* expr) {
 
   VisitForAccumulatorValue(args->at(0));
 
+  Label hook_true, hook_false;
   Label materialize_true, materialize_false;
   Label* if_true = NULL;
   Label* if_false = NULL;
@@ -2623,10 +2900,17 @@ void FullCodeGenerator::EmitIsTypedArray(CallRuntime* expr) {
   context()->PrepareTest(&materialize_true, &materialize_false, &if_true,
                          &if_false, &fall_through);
 
-  __ JumpIfSmi(rax, if_false);
+  __ JumpIfSmi(rax, &hook_false);
   __ CmpObjectType(rax, JS_TYPED_ARRAY_TYPE, rbx);
   PrepareForBailoutBeforeSplit(expr, true, if_true, if_false);
-  Split(equal, if_true, if_false, fall_through);
+  Split(equal, &hook_true, &hook_false, NULL);
+
+  __ bind(&hook_true);
+  GenerateTaintTrackingHookImmediate(true, expr);
+  __ jmp(if_true);
+  __ bind(&hook_false);
+  GenerateTaintTrackingHookImmediate(false, expr);
+  __ jmp(if_false);
 
   context()->Plug(if_true, if_false);
 }
@@ -2638,6 +2922,7 @@ void FullCodeGenerator::EmitIsRegExp(CallRuntime* expr) {
 
   VisitForAccumulatorValue(args->at(0));
 
+  Label hook_true, hook_false;
   Label materialize_true, materialize_false;
   Label* if_true = NULL;
   Label* if_false = NULL;
@@ -2645,10 +2930,17 @@ void FullCodeGenerator::EmitIsRegExp(CallRuntime* expr) {
   context()->PrepareTest(&materialize_true, &materialize_false,
                          &if_true, &if_false, &fall_through);
 
-  __ JumpIfSmi(rax, if_false);
+  __ JumpIfSmi(rax, &hook_false);
   __ CmpObjectType(rax, JS_REGEXP_TYPE, rbx);
   PrepareForBailoutBeforeSplit(expr, true, if_true, if_false);
-  Split(equal, if_true, if_false, fall_through);
+  Split(equal, &hook_true, &hook_false, NULL);
+
+  __ bind(&hook_true);
+  GenerateTaintTrackingHookImmediate(true, expr);
+  __ jmp(if_true);
+  __ bind(&hook_false);
+  GenerateTaintTrackingHookImmediate(false, expr);
+  __ jmp(if_false);
 
   context()->Plug(if_true, if_false);
 }
@@ -2660,6 +2952,7 @@ void FullCodeGenerator::EmitIsJSProxy(CallRuntime* expr) {
 
   VisitForAccumulatorValue(args->at(0));
 
+  Label hook_true, hook_false;
   Label materialize_true, materialize_false;
   Label* if_true = NULL;
   Label* if_false = NULL;
@@ -2668,10 +2961,17 @@ void FullCodeGenerator::EmitIsJSProxy(CallRuntime* expr) {
                          &if_false, &fall_through);
 
 
-  __ JumpIfSmi(rax, if_false);
+  __ JumpIfSmi(rax, &hook_false);
   __ CmpObjectType(rax, JS_PROXY_TYPE, rbx);
   PrepareForBailoutBeforeSplit(expr, true, if_true, if_false);
-  Split(equal, if_true, if_false, fall_through);
+  Split(equal, &hook_true, &hook_false, NULL);
+
+  __ bind(&hook_true);
+  GenerateTaintTrackingHookImmediate(true, expr);
+  __ jmp(if_true);
+  __ bind(&hook_false);
+  GenerateTaintTrackingHookImmediate(false, expr);
+  __ jmp(if_false);
 
   context()->Plug(if_true, if_false);
 }
@@ -2723,6 +3023,7 @@ void FullCodeGenerator::EmitClassOf(CallRuntime* expr) {
   // All done.
   __ bind(&done);
 
+  GenerateTaintTrackingHook(rax, expr);
   context()->Plug(rax);
 }
 
@@ -2742,6 +3043,7 @@ void FullCodeGenerator::EmitStringCharFromCode(CallRuntime* expr) {
   generator.GenerateSlow(masm_, call_helper);
 
   __ bind(&done);
+  GenerateTaintTrackingHook(rbx, expr);
   context()->Plug(rbx);
 }
 
@@ -2783,6 +3085,7 @@ void FullCodeGenerator::EmitStringCharCodeAt(CallRuntime* expr) {
   generator.GenerateSlow(masm_, NOT_PART_OF_IC_HANDLER, call_helper);
 
   __ bind(&done);
+  GenerateTaintTrackingHook(result, expr);
   context()->Plug(result);
 }
 
@@ -2791,10 +3094,18 @@ void FullCodeGenerator::EmitCall(CallRuntime* expr) {
   ZoneList<Expression*>* args = expr->arguments();
   DCHECK_LE(2, args->length());
   // Push target, receiver and arguments onto the stack.
+
+  GenerateTaintTrackingPrepareFrame(
+      tainttracking::FrameType::JS_CALL_RUNTIME);
+
   for (Expression* const arg : *args) {
     VisitForStackValue(arg);
+    GenerateTaintTrackingAddArgument(arg);
   }
   PrepareForBailoutForId(expr->CallId(), BailoutState::NO_REGISTERS);
+
+  GenerateTaintTrackingEnterFrame();
+
   // Move target to rdi.
   int const argc = args->length() - 2;
   __ movp(rdi, Operand(rsp, (argc + 1) * kPointerSize));
@@ -2803,7 +3114,11 @@ void FullCodeGenerator::EmitCall(CallRuntime* expr) {
   __ Call(isolate()->builtins()->Call(), RelocInfo::CODE_TARGET);
   OperandStackDepthDecrement(argc + 1);
   RestoreContext();
+
+  GenerateTaintTrackingExitFrame();
+
   // Discard the function left on TOS.
+  GenerateTaintTrackingHook(rax, expr);
   context()->DropAndPlug(1, rax);
 }
 
@@ -2814,6 +3129,7 @@ void FullCodeGenerator::EmitHasCachedArrayIndex(CallRuntime* expr) {
 
   VisitForAccumulatorValue(args->at(0));
 
+  Label hook_true;
   Label materialize_true, materialize_false;
   Label* if_true = NULL;
   Label* if_false = NULL;
@@ -2824,8 +3140,13 @@ void FullCodeGenerator::EmitHasCachedArrayIndex(CallRuntime* expr) {
   __ testl(FieldOperand(rax, String::kHashFieldOffset),
            Immediate(String::kContainsCachedArrayIndexMask));
   PrepareForBailoutBeforeSplit(expr, true, if_true, if_false);
-  __ j(zero, if_true);
+  __ j(zero, &hook_true);
+  GenerateTaintTrackingHookImmediate(false, expr);
   __ jmp(if_false);
+
+  __ bind(&hook_true);
+  GenerateTaintTrackingHookImmediate(true, expr);
+  __ jmp(if_true);
 
   context()->Plug(if_true, if_false);
 }
@@ -2842,6 +3163,7 @@ void FullCodeGenerator::EmitGetCachedArrayIndex(CallRuntime* expr) {
   DCHECK(String::kHashShift >= kSmiTagSize);
   __ IndexFromHash(rax, rax);
 
+  GenerateTaintTrackingHook(rax, expr);
   context()->Plug(rax);
 }
 
@@ -2853,6 +3175,7 @@ void FullCodeGenerator::EmitGetSuperConstructor(CallRuntime* expr) {
   __ AssertFunction(rax);
   __ movp(rax, FieldOperand(rax, HeapObject::kMapOffset));
   __ movp(rax, FieldOperand(rax, Map::kPrototypeOffset));
+  GenerateTaintTrackingHook(rax, expr);
   context()->Plug(rax);
 }
 
@@ -2863,6 +3186,7 @@ void FullCodeGenerator::EmitDebugIsActive(CallRuntime* expr) {
   __ Move(kScratchRegister, debug_is_active);
   __ movzxbp(rax, Operand(kScratchRegister, 0));
   __ Integer32ToSmi(rax, rax);
+  GenerateTaintTrackingHook(rax, expr);
   context()->Plug(rax);
 }
 
@@ -2891,6 +3215,7 @@ void FullCodeGenerator::EmitCreateIterResultObject(CallRuntime* expr) {
   CallRuntimeWithOperands(Runtime::kCreateIterResultObject);
 
   __ bind(&done);
+  GenerateTaintTrackingHook(rax, expr);
   context()->Plug(rax);
 }
 
@@ -2921,6 +3246,20 @@ void FullCodeGenerator::EmitCallJSRuntimeFunction(CallRuntime* expr) {
 
 
 void FullCodeGenerator::VisitUnaryOperation(UnaryOperation* expr) {
+  if (tainttracking::TaintTracker::FromIsolate(isolate_)->
+      IsRewriteAstEnabled()) {
+    {
+      StackValueContext for_stack(this);
+      BuildUnaryOperation(expr);
+    }
+    GenerateTaintTrackingHookTOS(expr);
+    context()->PlugTOS();
+  } else {
+    BuildUnaryOperation(expr);
+  }
+}
+
+void FullCodeGenerator::BuildUnaryOperation(UnaryOperation* expr) {
   switch (expr->op()) {
     case Token::DELETE: {
       Comment cmnt(masm_, "[ UnaryOperation (DELETE)");
@@ -2964,6 +3303,9 @@ void FullCodeGenerator::VisitUnaryOperation(UnaryOperation* expr) {
         VisitForEffect(expr->expression());
         context()->Plug(true);
       }
+      GenerateTaintTrackingHook(
+          tainttracking::ValueState::OPTIMIZED_OUT,
+          expr->expression());
       break;
     }
 
@@ -3031,7 +3373,7 @@ void FullCodeGenerator::VisitUnaryOperation(UnaryOperation* expr) {
       __ movp(rbx, rax);
       TypeofStub typeof_stub(isolate());
       __ CallStub(&typeof_stub);
-      context()->Plug(rax);
+       context()->Plug(rax);
       break;
     }
 
@@ -3054,6 +3396,12 @@ void FullCodeGenerator::VisitCountOperation(CountOperation* expr) {
     DCHECK(expr->expression()->AsVariableProxy()->var() != NULL);
     AccumulatorValueContext context(this);
     EmitVariableLoad(expr->expression()->AsVariableProxy());
+
+    PushOperand(rax);
+    GenerateTaintTrackingHook(
+        tainttracking::ValueState::LVALUE, expr->expression());
+    PopOperand(rax);
+
   } else {
     // Reserve space for result of postfix operation.
     if (expr->is_postfix() && !context()->IsEffect()) {
@@ -3064,6 +3412,13 @@ void FullCodeGenerator::VisitCountOperation(CountOperation* expr) {
         VisitForStackValue(prop->obj());
         __ movp(LoadDescriptor::ReceiverRegister(), Operand(rsp, 0));
         EmitNamedPropertyLoad(prop);
+
+        PushOperand(rax);
+        GenerateTaintTrackingHook(
+            tainttracking::ValueState::PROPERTY_LVALUE, prop);
+        __ movp(rax, Operand(rsp, 0));
+        GenerateTaintTrackingHook(rax, prop);
+        PopOperand(rax);
         break;
       }
 
@@ -3075,6 +3430,13 @@ void FullCodeGenerator::VisitCountOperation(CountOperation* expr) {
         PushOperand(MemOperand(rsp, kPointerSize));
         PushOperand(result_register());
         EmitNamedSuperPropertyLoad(prop);
+
+        PushOperand(rax);
+        GenerateTaintTrackingHook(
+            tainttracking::ValueState::PROPERTY_LVALUE, prop);
+        __ movp(rax, Operand(rsp, 0));
+        GenerateTaintTrackingHook(rax, prop);
+        PopOperand(rax);
         break;
       }
 
@@ -3088,6 +3450,13 @@ void FullCodeGenerator::VisitCountOperation(CountOperation* expr) {
         PushOperand(MemOperand(rsp, 2 * kPointerSize));
         PushOperand(result_register());
         EmitKeyedSuperPropertyLoad(prop);
+
+        PushOperand(rax);
+        GenerateTaintTrackingHook(
+            tainttracking::ValueState::PROPERTY_LVALUE, prop);
+        __ movp(rax, Operand(rsp, 0));
+        GenerateTaintTrackingHook(rax, prop);
+        PopOperand(rax);
         break;
       }
 
@@ -3099,6 +3468,13 @@ void FullCodeGenerator::VisitCountOperation(CountOperation* expr) {
         // Copy of key, needed for later store.
         __ movp(LoadDescriptor::NameRegister(), Operand(rsp, 0));
         EmitKeyedPropertyLoad(prop);
+
+        PushOperand(rax);
+        GenerateTaintTrackingHook(
+            tainttracking::ValueState::PROPERTY_LVALUE, prop);
+        __ movp(rax, Operand(rsp, 0));
+        GenerateTaintTrackingHook(rax, prop);
+        PopOperand(rax);
         break;
       }
 
@@ -3212,7 +3588,9 @@ void FullCodeGenerator::VisitCountOperation(CountOperation* expr) {
         // Perform the assignment as if via '='.
         { EffectContext context(this);
           EmitVariableAssignment(expr->expression()->AsVariableProxy()->var(),
-                                 Token::ASSIGN, expr->CountSlot());
+                                 Token::ASSIGN,
+                                 expr->CountSlot(),
+                                 expr);
           PrepareForBailoutForId(expr->AssignmentId(),
                                  BailoutState::TOS_REGISTER);
           context.Plug(rax);
@@ -3220,18 +3598,30 @@ void FullCodeGenerator::VisitCountOperation(CountOperation* expr) {
         // For all contexts except kEffect: We have the result on
         // top of the stack.
         if (!context()->IsEffect()) {
+          GenerateTaintTrackingHookTOS(expr);
           context()->PlugTOS();
+        } else {
+          GenerateTaintTrackingHook(
+              tainttracking::ValueState::OPTIMIZED_OUT, expr);
         }
       } else {
         // Perform the assignment as if via '='.
         EmitVariableAssignment(expr->expression()->AsVariableProxy()->var(),
-                               Token::ASSIGN, expr->CountSlot());
+                               Token::ASSIGN,
+                               expr->CountSlot(),
+                               expr);
         PrepareForBailoutForId(expr->AssignmentId(),
                                BailoutState::TOS_REGISTER);
+        GenerateTaintTrackingHook(rax, expr);
         context()->Plug(rax);
       }
       break;
     case NAMED_PROPERTY: {
+      PushOperand(rax);
+      GenerateTaintTrackingHookMemoryStorage(
+          rax, expr, tainttracking::CheckType::EXPRESSION_PROPERTY_STORE);
+      PopOperand(rax);
+
       __ Move(StoreDescriptor::NameRegister(),
               prop->key()->AsLiteral()->value());
       PopOperand(StoreDescriptor::ReceiverRegister());
@@ -3240,38 +3630,68 @@ void FullCodeGenerator::VisitCountOperation(CountOperation* expr) {
       PrepareForBailoutForId(expr->AssignmentId(), BailoutState::TOS_REGISTER);
       if (expr->is_postfix()) {
         if (!context()->IsEffect()) {
+          GenerateTaintTrackingHookTOS(expr);
           context()->PlugTOS();
+        } else {
+          GenerateTaintTrackingHook(
+              tainttracking::ValueState::OPTIMIZED_OUT, expr);
         }
       } else {
+        GenerateTaintTrackingHook(rax, expr);
         context()->Plug(rax);
       }
       break;
     }
     case NAMED_SUPER_PROPERTY: {
+      PushOperand(rax);
+      GenerateTaintTrackingHookMemoryStorage(
+          rax, expr, tainttracking::CheckType::EXPRESSION_PROPERTY_STORE);
+      PopOperand(rax);
+
       EmitNamedSuperPropertyStore(prop);
       PrepareForBailoutForId(expr->AssignmentId(), BailoutState::TOS_REGISTER);
       if (expr->is_postfix()) {
         if (!context()->IsEffect()) {
+          GenerateTaintTrackingHookTOS(expr);
           context()->PlugTOS();
+        } else {
+          GenerateTaintTrackingHook(
+              tainttracking::ValueState::OPTIMIZED_OUT, expr);
         }
       } else {
+        GenerateTaintTrackingHook(rax, expr);
         context()->Plug(rax);
       }
       break;
     }
     case KEYED_SUPER_PROPERTY: {
+      PushOperand(rax);
+      GenerateTaintTrackingHookMemoryStorage(
+          rax, expr, tainttracking::CheckType::EXPRESSION_PROPERTY_STORE);
+      PopOperand(rax);
+
       EmitKeyedSuperPropertyStore(prop);
       PrepareForBailoutForId(expr->AssignmentId(), BailoutState::TOS_REGISTER);
       if (expr->is_postfix()) {
         if (!context()->IsEffect()) {
+          GenerateTaintTrackingHookTOS(expr);
           context()->PlugTOS();
+        } else {
+          GenerateTaintTrackingHook(
+              tainttracking::ValueState::OPTIMIZED_OUT, expr);
         }
       } else {
+        GenerateTaintTrackingHook(rax, expr);
         context()->Plug(rax);
       }
       break;
     }
     case KEYED_PROPERTY: {
+      PushOperand(rax);
+      GenerateTaintTrackingHookMemoryStorage(
+          rax, expr, tainttracking::CheckType::EXPRESSION_PROPERTY_STORE);
+      PopOperand(rax);
+
       PopOperand(StoreDescriptor::NameRegister());
       PopOperand(StoreDescriptor::ReceiverRegister());
       Handle<Code> ic =
@@ -3281,9 +3701,14 @@ void FullCodeGenerator::VisitCountOperation(CountOperation* expr) {
       PrepareForBailoutForId(expr->AssignmentId(), BailoutState::TOS_REGISTER);
       if (expr->is_postfix()) {
         if (!context()->IsEffect()) {
+          GenerateTaintTrackingHookTOS(expr);
           context()->PlugTOS();
+        } else {
+          GenerateTaintTrackingHook(
+              tainttracking::ValueState::OPTIMIZED_OUT, expr);
         }
       } else {
+        GenerateTaintTrackingHook(rax, expr);
         context()->Plug(rax);
       }
       break;
@@ -3294,7 +3719,8 @@ void FullCodeGenerator::VisitCountOperation(CountOperation* expr) {
 
 void FullCodeGenerator::EmitLiteralCompareTypeof(Expression* expr,
                                                  Expression* sub_expr,
-                                                 Handle<String> check) {
+                                                 Handle<String> check,
+                                                 Expression* typeofexpr_taint) {
   Label materialize_true, materialize_false;
   Label* if_true = NULL;
   Label* if_false = NULL;
@@ -3305,6 +3731,10 @@ void FullCodeGenerator::EmitLiteralCompareTypeof(Expression* expr,
   { AccumulatorValueContext context(this);
     VisitForTypeofValue(sub_expr);
   }
+  if (typeofexpr_taint) {
+    GenerateTaintTrackingHook(rax, typeofexpr_taint);
+  }
+
   PrepareForBailoutBeforeSplit(expr, true, if_true, if_false);
 
   Factory* factory = isolate()->factory();
@@ -3379,6 +3809,22 @@ void FullCodeGenerator::VisitCompareOperation(CompareOperation* expr) {
   // the operands is a literal.
   if (TryLiteralCompare(expr)) return;
 
+  if (tainttracking::TaintTracker::FromIsolate(isolate_)->
+      IsRewriteAstEnabled()) {
+    {
+      StackValueContext on_stack(this);
+      GenerateCompareOperation(expr);
+    }
+    GenerateTaintTrackingHookTOS(expr);
+    context()->PlugTOS();
+  } else {
+    GenerateCompareOperation(expr);
+  }
+}
+
+
+void FullCodeGenerator::GenerateCompareOperation(CompareOperation* expr) {
+
   // Always perform the comparison for its control flow.  Pack the result
   // into the expression's context after the comparison is performed.
   Label materialize_true, materialize_false;
@@ -3414,6 +3860,9 @@ void FullCodeGenerator::VisitCompareOperation(CompareOperation* expr) {
 
     default: {
       VisitForAccumulatorValue(expr->right());
+
+      GenerateTaintTrackingMessageOriginCheck(op);
+
       SetExpressionPosition(expr);
       Condition cc = CompareIC::ComputeCondition(op);
       PopOperand(rdx);
@@ -3569,6 +4018,7 @@ void FullCodeGenerator::DeferredCommands::EmitCommands() {
         codegen_->EmitUnwindAndReturn();
         break;
       case kThrow:
+        codegen_->GenerateTaintTrackingHookExitFinally();
         __ Push(result_register());
         __ CallRuntime(Runtime::kReThrow);
         break;

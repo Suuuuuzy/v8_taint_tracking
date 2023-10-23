@@ -1736,6 +1736,9 @@ void NewSpace::Verify() {
       // The first word should be a map, and we expect all map pointers to
       // be in map space.
       Map* map = object->map();
+      if (!map->IsMap()) {
+        printf("map %p, object %p\n", map, object);
+      }
       CHECK(map->IsMap());
       CHECK(heap()->map_space()->Contains(map));
 

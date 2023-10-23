@@ -20,6 +20,7 @@
 #include "src/log.h"
 #include "src/msan.h"
 #include "src/objects-inl.h"
+#include "src/taint_tracking.h"
 #include "src/type-feedback-vector-inl.h"
 
 namespace v8 {
@@ -140,7 +141,7 @@ AllocationResult Heap::AllocateOneByteInternalizedString(
   // String maps are all immortal immovable objects.
   result->set_map_no_write_barrier(map);
   // Set length and hash fields of the allocated string.
-  String* answer = String::cast(result);
+  SeqOneByteString* answer = SeqOneByteString::cast(result);
   answer->set_length(str.length());
   answer->set_hash_field(hash_field);
 
@@ -149,6 +150,7 @@ AllocationResult Heap::AllocateOneByteInternalizedString(
   // Fill in the characters.
   MemCopy(answer->address() + SeqOneByteString::kHeaderSize, str.start(),
           str.length());
+  tainttracking::InitTaintData(answer);
 
   return answer;
 }
@@ -170,7 +172,7 @@ AllocationResult Heap::AllocateTwoByteInternalizedString(Vector<const uc16> str,
 
   result->set_map(map);
   // Set length and hash fields of the allocated string.
-  String* answer = String::cast(result);
+  SeqTwoByteString* answer = SeqTwoByteString::cast(result);
   answer->set_length(str.length());
   answer->set_hash_field(hash_field);
 
@@ -179,6 +181,7 @@ AllocationResult Heap::AllocateTwoByteInternalizedString(Vector<const uc16> str,
   // Fill in the characters.
   MemCopy(answer->address() + SeqTwoByteString::kHeaderSize, str.start(),
           str.length() * kUC16Size);
+  tainttracking::InitTaintData(answer);
 
   return answer;
 }

@@ -193,6 +193,7 @@ enum ContextLookupFlags {
   V(SCRIPT_CONTEXT_TABLE_INDEX, ScriptContextTable, script_context_table)      \
   V(SCRIPT_FUNCTION_INDEX, JSFunction, script_function)                        \
   V(SECURITY_TOKEN_INDEX, Object, security_token)                              \
+  V(TAINT_TRACKING_CONTEXT_ID_INDEX, Object, taint_tracking_context_id)        \
   V(SELF_WEAK_CELL_INDEX, WeakCell, self_weak_cell)                            \
   V(SET_ITERATOR_MAP_INDEX, Map, set_iterator_map)                             \
   V(SHARED_ARRAY_BUFFER_FUN_INDEX, JSFunction, shared_array_buffer_fun)        \
@@ -243,6 +244,7 @@ class ScriptContextTable : public FixedArray {
 
   struct LookupResult {
     int context_index;
+    int taint_symbolic_index;
     int slot_index;
     VariableMode mode;
     InitializationFlag init_flag;
@@ -473,7 +475,8 @@ class Context: public FixedArray {
   Handle<Object> Lookup(Handle<String> name, ContextLookupFlags flags,
                         int* index, PropertyAttributes* attributes,
                         InitializationFlag* init_flag,
-                        VariableMode* variable_mode);
+                        VariableMode* variable_mode,
+                        int* sym_index = nullptr);
 
   // Code generation support.
   static int SlotOffset(int index) {

@@ -9,6 +9,7 @@
 #include "src/checks.h"
 #include "src/handles.h"
 #include "src/zone-containers.h"
+#include "src/frames.h"
 
 namespace v8 {
 namespace internal {
@@ -21,13 +22,17 @@ class Zone;
 
 struct PositionTableEntry {
   PositionTableEntry()
-      : code_offset(0), source_position(0), is_statement(false) {}
-  PositionTableEntry(int offset, int source, bool statement)
-      : code_offset(offset), source_position(source), is_statement(statement) {}
+    : code_offset(0), source_position(0), is_statement(false),
+      ast_taint_tracking_index(-1) {}
+  PositionTableEntry(int offset, int source, bool statement,
+                     int ast_taint_tracking_index)
+    : code_offset(offset), source_position(source), is_statement(statement),
+      ast_taint_tracking_index(ast_taint_tracking_index) {}
 
   int code_offset;
   int source_position;
   bool is_statement;
+  int ast_taint_tracking_index;
 };
 
 class SourcePositionTableBuilder {
@@ -39,7 +44,11 @@ class SourcePositionTableBuilder {
 
   void EndJitLogging(AbstractCode* code);
 
-  void AddPosition(size_t code_offset, int source_position, bool is_statement);
+  static constexpr int NO_TAINT_TRACKING_INDEX =
+    v8::internal::StackFrame::TaintStackFrameInfo::UNINSTRUMENTED;
+
+  void AddPosition(size_t code_offset, int source_position, bool is_statement,
+                   int ast_taint_tracking_index);
   Handle<ByteArray> ToSourcePositionTable();
 
  private:
@@ -76,6 +85,10 @@ class SourcePositionTableIterator {
   bool is_statement() const {
     DCHECK(!done());
     return current_.is_statement;
+  }
+  int ast_taint_tracking_index() const {
+    DCHECK(!done());
+    return current_.ast_taint_tracking_index;
   }
   bool done() const { return index_ == kDone; }
 

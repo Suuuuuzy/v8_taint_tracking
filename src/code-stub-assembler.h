@@ -357,6 +357,7 @@ class CodeStubAssembler : public compiler::CodeAssembler {
   void SetCounter(StatsCounter* counter, int value);
   void IncrementCounter(StatsCounter* counter, int delta);
   void DecrementCounter(StatsCounter* counter, int delta);
+  void IncrementAndStoreTaintInstanceCounter(compiler::Node* result);
 
   // Generates "if (false) goto label" code. Useful for marking a label as
   // "live" to avoid assertion failures during graph building. In the resulting

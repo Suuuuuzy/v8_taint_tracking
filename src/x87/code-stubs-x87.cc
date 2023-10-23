@@ -1919,6 +1919,10 @@ void SubStringStub::Generate(MacroAssembler* masm) {
   //  esp[8]: from
   //  esp[12]: string
 
+  // TODO: ideally, would code taint-tracking in assembly too.
+  // Taint tracking requires by-passing the sub-string assembly code.
+  __ j(not_zero, &runtime);
+
   // Make sure first argument is a string.
   __ mov(eax, Operand(esp, 3 * kPointerSize));
   STATIC_ASSERT(kSmiTag == 0);

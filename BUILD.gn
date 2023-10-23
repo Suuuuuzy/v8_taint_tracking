@@ -106,6 +106,14 @@ config("internal_config") {
 
   include_dirs = [ "." ]
 
+  # Used to link with the capnp library for taint tracking code
+  libs = [ "capnp", "kj" ]
+  
+  if (!(v8_capnp_include_dir == "")) {
+    lib_dirs = [ "$v8_capnp_include_dir/lib" ]
+    include_dirs += [ "$v8_capnp_include_dir/include" ]
+  }
+
   if (is_component_build) {
     defines = [
       "V8_SHARED",
@@ -188,6 +196,11 @@ config("features") {
   }
   if (v8_use_external_startup_data) {
     defines += [ "V8_USE_EXTERNAL_STARTUP_DATA" ]
+  }
+
+  # For taint tracking
+  if (v8_taint_tracking_include_concolic) {
+    defines += [ "V8_TAINT_TRACKING_INCLUDE_CONCOLIC" ]
   }
 }
 
@@ -348,6 +361,37 @@ config("toolchain") {
 ###############################################################################
 # Actions
 #
+
+
+action("v8_capnp_generate") {
+  visibility = [ ":*" ]
+
+  # Needed by taint logging
+  script = "tools/run.py"
+
+  sources = [
+    "src/taint_tracking/protos/logrecord.capnp",
+    "src/taint_tracking/protos/ast.capnp",
+  ]
+
+  outputs = [
+    "$target_gen_dir/logrecord.capnp.c++",
+    "$target_gen_dir/logrecord.capnp.h",
+    "$target_gen_dir/ast.capnp.c++",
+    "$target_gen_dir/ast.capnp.h",
+  ]
+
+  args = [
+    "$v8_capnp_include_dir/bin/capnp",
+    "compile",
+    "--src-prefix=" + rebase_path(
+        "src/taint_tracking/protos/", root_build_dir),
+    "--output=c++:" + rebase_path("$target_gen_dir/", root_build_dir),
+    rebase_path("src/taint_tracking/protos/logrecord.capnp", root_build_dir),
+    rebase_path("src/taint_tracking/protos/ast.capnp", root_build_dir),
+  ]
+}
+
 
 action("js2c") {
   visibility = [ ":*" ]  # Only targets in this file can depend on this.
@@ -1594,6 +1638,20 @@ v8_source_set("v8_base") {
     "src/string-stream.h",
     "src/strtod.cc",
     "src/strtod.h",
+    "src/taint_tracking.h",
+    "src/taint_tracking-inl.h",
+    "src/taint_tracking/taint_tracking.cc",
+    "src/taint_tracking/ast_serialization.cc",
+    "src/taint_tracking/ast_serialization.h",
+    "src/taint_tracking/symbolic_state.h",
+    "src/taint_tracking/symbolic_state.cc",
+    "src/taint_tracking/log_listener.h",
+    "src/taint_tracking/object_versioner.cc",
+    "src/taint_tracking/object_versioner.h",
+    "$target_gen_dir/logrecord.capnp.c++",
+    "$target_gen_dir/logrecord.capnp.h",
+    "$target_gen_dir/ast.capnp.c++",
+    "$target_gen_dir/ast.capnp.h",
     "src/tracing/trace-event.cc",
     "src/tracing/trace-event.h",
     "src/transitions-inl.h",
@@ -1980,10 +2038,14 @@ v8_source_set("v8_base") {
   deps = [
     ":v8_libbase",
     ":v8_libsampler",
+    ":v8_capnp_generate",
   ]
 
   sources += [ v8_generated_peephole_source ]
   deps += [ ":run_mkpeephole" ]
+
+  # Include capnp for taint tracking logging
+  include_dirs = [ rebase_path("$target_gen_dir/", root_build_dir) ]
 
   if (is_win) {
     # TODO(jschuh): crbug.com/167187 fix size_t to int truncations.

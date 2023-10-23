@@ -169,6 +169,7 @@
       'test-strings.cc',
       'test-symbols.cc',
       'test-strtod.cc',
+      'test-taint-tracking.cc',
       'test-thread-termination.cc',
       'test-threads.cc',
       'test-trace-event.cc',

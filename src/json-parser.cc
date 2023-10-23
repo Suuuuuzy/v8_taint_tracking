@@ -623,6 +623,7 @@ Handle<String> JsonParser<seq_one_byte>::SlowScanJsonString(
   // Copy prefix into seq_str.
   SinkChar* dest = seq_string->GetChars();
   String::WriteToFlat(*prefix, dest, start, end);
+  tainttracking::FlattenTaint(*prefix, *seq_string, start, count);
 
   while (c0_ != '"') {
     // Check for control character (0x00-0x1f) or unterminated string (<0).
@@ -638,6 +639,10 @@ Handle<String> JsonParser<seq_one_byte>::SlowScanJsonString(
       // in the Latin1 sink.
       if (sizeof(SinkChar) == kUC16Size || seq_one_byte ||
           c0_ <= String::kMaxOneByteCharCode) {
+        tainttracking::SetTaintStatus(
+            *seq_string,
+            count,
+            tainttracking::GetTaintStatus(*source_, position_));
         SeqStringSet(seq_string, count++, c0_);
         Advance();
       } else {
@@ -646,6 +651,10 @@ Handle<String> JsonParser<seq_one_byte>::SlowScanJsonString(
       }
     } else {
       Advance();  // Advance past the \.
+      tainttracking::SetTaintStatus(
+            *seq_string,
+            count,
+            tainttracking::GetTaintStatus(*source_, position_));
       switch (c0_) {
         case '"':
         case '\\':
@@ -702,7 +711,13 @@ Handle<String> JsonParser<seq_one_byte>::SlowScanJsonString(
   AdvanceSkipWhitespace();
 
   // Shrink seq_string length to count and return.
-  return SeqString::Truncate(seq_string, count);
+  Handle<StringType> answer = Handle<StringType>::cast(
+        SeqString::Truncate(seq_string, count));
+  {
+    DisallowHeapAllocation no_gc;
+    tainttracking::OnNewFromJsonString(*seq_string, *source_);
+  }
+  return answer;
 }
 
 template <bool seq_one_byte>
@@ -793,15 +808,15 @@ Handle<String> JsonParser<seq_one_byte>::ScanJsonString() {
     }
   } while (c0_ != '"');
   int length = position_ - beg_pos;
-  Handle<String> result =
+  Handle<SeqString> result =
       factory()->NewRawOneByteString(length, pretenure_).ToHandleChecked();
   uint8_t* dest = SeqOneByteString::cast(*result)->GetChars();
   String::WriteToFlat(*source_, dest, beg_pos, position_);
-
+  tainttracking::OnNewSubStringCopy(*source_, *result, beg_pos, length);
   DCHECK_EQ('"', c0_);
   // Advance past the last '"'.
   AdvanceSkipWhitespace();
-  return result;
+  return Handle<String>::cast(result);
 }
 
 // Explicit instantiation.

@@ -132,6 +132,8 @@ class AstGraphBuilder : public AstVisitor<AstGraphBuilder> {
   // new nodes.
   static const int kInputBufferSizeIncrement = 64;
 
+  tainttracking::V8NodeLabelSerializer node_label_serializer_;
+
   Zone* local_zone() const { return local_zone_; }
   Environment* environment() const { return environment_; }
   AstContext* ast_context() const { return ast_context_; }
@@ -393,6 +395,11 @@ class AstGraphBuilder : public AstVisitor<AstGraphBuilder> {
   // Optimizations for automatic type conversion.
   Node* TryFastToBoolean(Node* input);
   Node* TryFastToName(Node* input);
+
+
+  void BuildUnaryOperation(UnaryOperation* expr);
+  void BuildCompare(CompareOperation* expr);
+  void BuildTaintTrackingHook(Node* input, Expression* expr);
 
   // ===========================================================================
   // The following visitation methods all recursively visit a subtree of the

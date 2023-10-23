@@ -198,14 +198,14 @@ Handle<ScopeInfo> ScopeInfo::Create(Isolate* isolate, Zone* zone,
                     *scope->AsDeclarationScope()->function()->proxy()->name());
     scope_info->set(index++, Smi::FromInt(var_index));
     DCHECK(function_name_info != CONTEXT ||
-           var_index == scope_info->ContextLength() - 1);
+           var_index == scope_info->ContextLengthWithoutTaint() - 1);
   }
 
   DCHECK(index == scope_info->length());
   DCHECK(scope->num_parameters() == scope_info->ParameterCount());
-  DCHECK(scope->num_heap_slots() == scope_info->ContextLength() ||
+  DCHECK(scope->num_heap_slots() == scope_info->ContextLengthWithoutTaint() ||
          (scope->num_heap_slots() == kVariablePartIndex &&
-          scope_info->ContextLength() == 0));
+          scope_info->ContextLengthWithoutTaint() == 0));
   return scope_info;
 }
 
@@ -272,7 +272,7 @@ Handle<ScopeInfo> ScopeInfo::CreateGlobalThisBinding(Isolate* isolate) {
 
   DCHECK_EQ(index, scope_info->length());
   DCHECK_EQ(scope_info->ParameterCount(), 0);
-  DCHECK_EQ(scope_info->ContextLength(), Context::MIN_CONTEXT_SLOTS + 1);
+  DCHECK_EQ(scope_info->ContextLengthWithoutTaint(), Context::MIN_CONTEXT_SLOTS + 1);
 
   return scope_info;
 }
@@ -313,11 +313,38 @@ int ScopeInfo::StackSlotCount() {
   if (length() > 0) {
     bool function_name_stack_slot =
         FunctionVariableField::decode(Flags()) == STACK;
-    return StackLocalCount() + (function_name_stack_slot ? 1 : 0);
+    return
+      ((// Allocate space for symbolic information of context variables
+          tainttracking::TaintTracker::FromIsolate(GetIsolate())->
+          IsRewriteAstEnabled() ?
+          2 : 1) * StackLocalCount()) +
+      (function_name_stack_slot ? 1 : 0);
   }
   return 0;
 }
 
+
+int ScopeInfo::ContextLengthWithoutTaint() {
+  if (length() > 0) {
+    int context_locals = ContextLocalCount();
+    int context_globals = ContextGlobalCount();
+    bool function_name_context_slot =
+        FunctionVariableField::decode(Flags()) == CONTEXT;
+    bool has_context = context_locals > 0 || context_globals > 0 ||
+                       function_name_context_slot ||
+                       scope_type() == WITH_SCOPE ||
+                       (scope_type() == BLOCK_SCOPE && CallsSloppyEval() &&
+                           is_declaration_scope()) ||
+                       (scope_type() == FUNCTION_SCOPE && CallsSloppyEval()) ||
+                       scope_type() == MODULE_SCOPE;
+
+    if (has_context) {
+      return Context::MIN_CONTEXT_SLOTS + context_locals + context_globals +
+        (function_name_context_slot ? 1 : 0);
+    }
+  }
+  return 0;
+}
 
 int ScopeInfo::ContextLength() {
   if (length() > 0) {
@@ -334,8 +361,21 @@ int ScopeInfo::ContextLength() {
                        scope_type() == MODULE_SCOPE;
 
     if (has_context) {
-      return Context::MIN_CONTEXT_SLOTS + context_locals + context_globals +
-             (function_name_context_slot ? 1 : 0);
+      return Context::MIN_CONTEXT_SLOTS +
+        (
+            (// Allocate space for symbolic information of context variables
+                // tainttracking::TaintTracker::FromIsolate(GetIsolate())->
+                // IsRewriteAstEnabled() ? 2 : 1
+                #ifdef V8_TAINT_TRACKING_INCLUDE_CONCOLIC
+                2
+                #endif
+
+                #ifndef V8_TAINT_TRACKING_INCLUDE_CONCOLIC
+                1
+                #endif
+            ) *
+            (context_locals + context_globals + (
+                function_name_context_slot ? 1 : 0)));
     }
   }
   return 0;
@@ -650,6 +690,19 @@ int ScopeInfo::ReceiverEntryIndex() {
 
 int ScopeInfo::FunctionNameEntryIndex() {
   return ReceiverEntryIndex() + (HasAllocatedReceiver() ? 1 : 0);
+}
+
+int ScopeInfo::SymbolicSlotFor(int var) {
+  int varidx = var - Context::MIN_CONTEXT_SLOTS;
+  int answer = ContextLengthWithoutTaint() + varidx;
+  DCHECK_LE(0, varidx);
+  DCHECK_LT(varidx,
+            ContextLocalCount() + ContextGlobalCount() +
+            (FunctionVariableField::decode(Flags()) == CONTEXT ? 1 : 0));
+  DCHECK_LT(answer, ContextLength());
+  DCHECK_LE(0, answer);
+  DCHECK_LE(ContextLengthWithoutTaint(), answer);
+  return answer;
 }
 
 #ifdef DEBUG

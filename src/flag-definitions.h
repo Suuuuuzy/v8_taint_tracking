@@ -258,6 +258,57 @@ HARMONY_STAGED(FLAG_STAGED_FEATURES)
 HARMONY_SHIPPING(FLAG_SHIPPING_FEATURES)
 #undef FLAG_SHIPPING_FEATURES
 
+
+DEFINE_STRING(taint_log_file, "",
+              "Output taint log information to this file. ")
+DEFINE_STRING(taint_tracking_job_id, "NO_JOB_ID",
+              "Job identifier. Opaque identifier for identifying output. ")
+DEFINE_INT(taint_tracking_heart_beat_millis, 5000,
+           "Number of milliseconds to write a heart beat to the log")
+DEFINE_BOOL(taint_tracking_enable_header_logging, false,
+            "Enable logging of HTTP headers. ")
+DEFINE_BOOL(taint_tracking_enable_page_logging, false,
+            "Enable logging MHTML bodies of pages. ")
+DEFINE_BOOL(taint_tracking_enable_symbolic, false,
+            "Enable symbolic logging. ")
+DEFINE_BOOL(taint_tracking_enable_ast_modification, false,
+            "Enable logging control flow branches. ")
+DEFINE_BOOL(taint_tracking_enable_export_ast, false,
+            "Enable logging the AST after parsing code. ")
+DEFINE_BOOL(taint_tracking_enable_concolic, false,
+            "Enable concolic execution. ")
+DEFINE_BOOL(taint_tracking_enable_concolic_hooks_only, false,
+            "Disable the actual concolic execution, but still leave hooks in for performance testing")
+DEFINE_BOOL(taint_tracking_enable_concolic_no_marshalling, false,
+            "Disable marshalling objects to disk for performance testing")
+DEFINE_BOOL(taint_tracking_enable_source_export, false,
+            "Enable exporting the source code. ")
+DEFINE_BOOL(taint_tracking_enable_source_hash_export, false,
+            "Enable exporting the hash of the source code. ")
+DEFINE_BOOL(taint_tracking_enable_message_origin_check, false,
+            "Enable tracking which cross-origin messages have checked "
+            "origins. ")
+DEFINE_BOOL(taint_tracking_logging_remove_native_scripts, false,
+            "Reduce log size by stripping out native and extension scripts when exporting source code and AST.")
+DEFINE_BOOL(taint_tracking_disable_code_caching, false,
+            "Disable cached code. ")
+DEFINE_BOOL(taint_tracking_write_packed_logs, false,
+            "Write packed taint tracking logs. ")
+DEFINE_BOOL(taint_tracking_sources_sinks_to_logs, false,
+            "Write to the log whenever a source or sink is executed.")
+
+
+DEFINE_IMPLICATION(
+    taint_tracking_enable_ast_modification, taint_tracking_disable_code_caching)
+DEFINE_IMPLICATION(
+    taint_tracking_enable_concolic, taint_tracking_enable_ast_modification)
+
+#ifdef DEBUG
+DEFINE_BOOL(taint_tracking_trace_concolic, false,
+            "Trace concolic execution for debug purposes and print to stderr. ")
+#endif
+
+
 // Flags for experimental implementation features.
 DEFINE_BOOL(compiled_keyed_generic_loads, false,
             "use optimizing compiler to generate keyed generic load stubs")
@@ -1151,6 +1202,7 @@ DEFINE_IMPLICATION(print_all_code, code_comments)
 DEFINE_IMPLICATION(print_all_code, trace_codegen)
 #endif
 #endif
+
 
 
 //

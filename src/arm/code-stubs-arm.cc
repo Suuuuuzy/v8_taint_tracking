@@ -2147,6 +2147,10 @@ void SubStringStub::Generate(MacroAssembler* masm) {
   //  0 <= from <= to <= string.length.
   // If any of these assumptions fail, we call the runtime system.
 
+  // TODO: ideally, would code taint-tracking in assembly too.
+  // Taint tracking requires by-passing the sub-string assembly code.
+  __ j(not_zero, &runtime);
+
   const int kToOffset = 0 * kPointerSize;
   const int kFromOffset = 1 * kPointerSize;
   const int kStringOffset = 2 * kPointerSize;

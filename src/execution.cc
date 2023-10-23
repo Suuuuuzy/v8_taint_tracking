@@ -56,7 +56,8 @@ MUST_USE_RESULT MaybeHandle<Object> Invoke(Isolate* isolate, bool is_construct,
                                            Handle<Object> target,
                                            Handle<Object> receiver, int argc,
                                            Handle<Object> args[],
-                                           Handle<Object> new_target) {
+                                           Handle<Object> new_target,
+                                           tainttracking::FrameType frametype) {
   DCHECK(!receiver->IsJSGlobalObject());
 
 #ifdef USE_SIMULATOR
@@ -92,6 +93,16 @@ MUST_USE_RESULT MaybeHandle<Object> Invoke(Isolate* isolate, bool is_construct,
       ? isolate->factory()->js_construct_entry_code()
       : isolate->factory()->js_entry_code();
 
+  tainttracking::RuntimePrepareSymbolicStackFrame(isolate, frametype);
+  for (int i = 0; i < argc; i++) {
+    tainttracking::RuntimeAddLiteralArgumentToStackFrame(isolate, args[i]);
+  }
+  tainttracking::RuntimeSetReceiver(
+      isolate,
+      receiver,
+      handle(isolate->heap()->undefined_value(), isolate));
+  tainttracking::RuntimeEnterSymbolicStackFrame(isolate);
+
   {
     // Save and restore context around invocation and block the
     // allocation of handles without explicit handle scopes.
@@ -113,6 +124,8 @@ MUST_USE_RESULT MaybeHandle<Object> Invoke(Isolate* isolate, bool is_construct,
     value = CALL_GENERATED_CODE(isolate, stub_entry, orig_func, func, recv,
                                 argc, argv);
   }
+
+  tainttracking::RuntimeExitSymbolicStackFrame(isolate);
 
 #ifdef VERIFY_HEAP
   if (FLAG_verify_heap) {
@@ -139,7 +152,8 @@ MUST_USE_RESULT MaybeHandle<Object> Invoke(Isolate* isolate, bool is_construct,
 // static
 MaybeHandle<Object> Execution::Call(Isolate* isolate, Handle<Object> callable,
                                     Handle<Object> receiver, int argc,
-                                    Handle<Object> argv[]) {
+                                    Handle<Object> argv[],
+                                    tainttracking::FrameType frametype) {
   // Convert calls on global objects to be calls on the global
   // receiver instead to avoid having a 'this' pointer which refers
   // directly to a global object.
@@ -156,7 +170,7 @@ MaybeHandle<Object> Execution::Call(Isolate* isolate, Handle<Object> callable,
     isolate->set_context(function->context());
     DCHECK(function->context()->global_object()->IsJSGlobalObject());
     auto value =
-        Builtins::InvokeApiFunction(isolate, function, receiver, argc, argv);
+      Builtins::InvokeApiFunction(isolate, function, receiver, argc, argv, frametype);
     bool has_exception = value.is_null();
     DCHECK(has_exception == isolate->has_pending_exception());
     if (has_exception) {
@@ -168,23 +182,25 @@ MaybeHandle<Object> Execution::Call(Isolate* isolate, Handle<Object> callable,
     return value;
   }
   return Invoke(isolate, false, callable, receiver, argc, argv,
-                isolate->factory()->undefined_value());
+                isolate->factory()->undefined_value(), frametype);
 }
 
 
 // static
 MaybeHandle<Object> Execution::New(Handle<JSFunction> constructor, int argc,
-                                   Handle<Object> argv[]) {
-  return New(constructor->GetIsolate(), constructor, constructor, argc, argv);
+                                   Handle<Object> argv[],
+                                   tainttracking::FrameType frametype) {
+  return New(constructor->GetIsolate(), constructor, constructor, argc, argv, frametype);
 }
 
 
 // static
 MaybeHandle<Object> Execution::New(Isolate* isolate, Handle<Object> constructor,
                                    Handle<Object> new_target, int argc,
-                                   Handle<Object> argv[]) {
+                                   Handle<Object> argv[],
+                                   tainttracking::FrameType frametype) {
   return Invoke(isolate, true, constructor,
-                isolate->factory()->undefined_value(), argc, argv, new_target);
+                isolate->factory()->undefined_value(), argc, argv, new_target, frametype);
 }
 
 

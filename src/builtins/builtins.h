@@ -347,6 +347,11 @@ namespace internal {
   /* Eval */                                                                 \
   CPP(GlobalEval)                                                            \
                                                                              \
+  /* TaintData */                                                            \
+  CPP(GlobalPrintToTaintLog)                                                 \
+  CPP(GlobalTaintConstants)                                                  \
+  CPP(GlobalSetTaint)                                                        \
+                                                                             \
   /* JSON */                                                                 \
   CPP(JsonParse)                                                             \
   CPP(JsonStringify)                                                         \
@@ -503,6 +508,9 @@ namespace internal {
   CPP(StringPrototypeTrim)                                                   \
   CPP(StringPrototypeTrimLeft)                                               \
   CPP(StringPrototypeTrimRight)                                              \
+  CPP(StringPrototypeSetTaint)                                               \
+  CPP(StringPrototypeGetTaint)                                               \
+  CPP(StringPrototypeCheckTaint)                                             \
   /* ES6 section 21.1.3.28 String.prototype.valueOf () */                    \
   TFJ(StringPrototypeValueOf, 1)                                             \
                                                                              \
@@ -601,7 +609,8 @@ class Builtins {
 
   MUST_USE_RESULT static MaybeHandle<Object> InvokeApiFunction(
       Isolate* isolate, Handle<HeapObject> function, Handle<Object> receiver,
-      int argc, Handle<Object> args[]);
+      int argc, Handle<Object> args[],
+      tainttracking::FrameType frametype = tainttracking::FrameType::UNKNOWN_EXTERNAL);
 
   enum ExitFrameType { EXIT, BUILTIN_EXIT };
 

@@ -9,6 +9,7 @@
 #include "src/builtins/builtins.h"
 #include "src/counters.h"
 #include "src/deoptimizer.h"
+#include "src/taint_tracking.h"
 #include "src/ic/stub-cache.h"
 
 namespace v8 {
@@ -40,6 +41,7 @@ ExternalReferenceTable::ExternalReferenceTable(Isolate* isolate) {
   AddStubCache(isolate);
   AddDeoptEntries(isolate);
   AddApiReferences(isolate);
+  AddTaintTracking(isolate);
 }
 
 void ExternalReferenceTable::AddReferences(Isolate* isolate) {
@@ -452,6 +454,13 @@ void ExternalReferenceTable::AddApiReferences(Isolate* isolate) {
       api_external_references++;
     }
   }
+}
+
+void ExternalReferenceTable::AddTaintTracking(Isolate* isolate) {
+  Add(reinterpret_cast<Address>(
+          tainttracking::TaintTracker::FromIsolate(isolate)
+          ->symbolic_elem_counter()),
+      "tainttracking::symbolic_elem_counter");
 }
 
 }  // namespace internal

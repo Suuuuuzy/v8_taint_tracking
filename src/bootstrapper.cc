@@ -1376,6 +1376,12 @@ void Genesis::InitializeGlobal(Handle<JSGlobalObject> global_object,
                           Builtins::kStringPrototypeTrimRight, 0, false);
     SimpleInstallFunction(prototype, "valueOf",
                           Builtins::kStringPrototypeValueOf, 0, true);
+    SimpleInstallFunction(prototype, "__setTaint__",
+                          Builtins::kStringPrototypeSetTaint, 1, true);
+    SimpleInstallFunction(prototype, "__getTaint__",
+                          Builtins::kStringPrototypeGetTaint, 0, true);
+    SimpleInstallFunction(prototype, "__checkTaint__",
+                          Builtins::kStringPrototypeCheckTaint, 1, true);
   }
 
   {
@@ -3084,6 +3090,13 @@ bool Genesis::InstallNatives(GlobalContextType context_type) {
                               Builtins::kGlobalEval, 1, false);
     native_context()->set_global_eval_fun(*eval);
   }
+
+  SimpleInstallFunction(global_object, "__printToTaintLog__",
+                        Builtins::kGlobalPrintToTaintLog, 2, false);
+  SimpleInstallFunction(global_object, "__taintConstants__",
+                        Builtins::kGlobalTaintConstants, 0, false);
+  SimpleInstallFunction(global_object, "__setTaint__",
+                        Builtins::kGlobalSetTaint, 2, false);
 
   // Install Array.prototype.concat
   {

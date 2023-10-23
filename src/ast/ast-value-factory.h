@@ -190,8 +190,10 @@ class AstValue : public ZoneObject {
     return value_;
   }
 
- private:
-  friend class AstValueFactory;
+  const char* AsSymbolName() const {
+    DCHECK_EQ(type_, SYMBOL);
+    return symbol_name_;
+  }
 
   enum Type {
     STRING,
@@ -204,6 +206,11 @@ class AstValue : public ZoneObject {
     UNDEFINED,
     THE_HOLE
   };
+
+  AstValue::Type GetType() const { return type_; }
+
+ private:
+  friend class AstValueFactory;
 
   explicit AstValue(const AstRawString* s) : type_(STRING) { string_ = s; }
 

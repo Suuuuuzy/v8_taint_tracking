@@ -372,7 +372,8 @@ THREADED_TEST(Script) {
 }
 
 
-class TestResource: public String::ExternalStringResource {
+class TestResource: public String::ExternalStringResource,
+                      public v8::String::TaintTrackingStringBufferImpl {
  public:
   explicit TestResource(uint16_t* data, int* counter = NULL,
                         bool owning_data = true)
@@ -401,7 +402,9 @@ class TestResource: public String::ExternalStringResource {
 };
 
 
-class TestOneByteResource : public String::ExternalOneByteStringResource {
+class TestOneByteResource :
+  public String::ExternalOneByteStringResource,
+  public v8::String::TaintTrackingStringBufferImpl {
  public:
   explicit TestOneByteResource(const char* data, int* counter = NULL,
                                size_t offset = 0)
@@ -676,7 +679,9 @@ THREADED_TEST(UsingExternalOneByteString) {
 }
 
 
-class RandomLengthResource : public v8::String::ExternalStringResource {
+class RandomLengthResource :
+  public v8::String::ExternalStringResource,
+  public v8::String::TaintTrackingStringBufferImpl {
  public:
   explicit RandomLengthResource(int length) : length_(length) {}
   virtual const uint16_t* data() const { return string_; }
@@ -689,7 +694,8 @@ class RandomLengthResource : public v8::String::ExternalStringResource {
 
 
 class RandomLengthOneByteResource
-    : public v8::String::ExternalOneByteStringResource {
+    : public v8::String::ExternalOneByteStringResource,
+      public v8::String::TaintTrackingStringBufferImpl {
  public:
   explicit RandomLengthOneByteResource(int length) : length_(length) {}
   virtual const char* data() const { return string_; }
@@ -15518,7 +15524,9 @@ TEST(ObjectClone) {
 }
 
 
-class OneByteVectorResource : public v8::String::ExternalOneByteStringResource {
+class OneByteVectorResource :
+  public v8::String::ExternalOneByteStringResource,
+  public v8::String::TaintTrackingStringBufferImpl {
  public:
   explicit OneByteVectorResource(i::Vector<const char> vector)
       : data_(vector) {}
@@ -15530,7 +15538,9 @@ class OneByteVectorResource : public v8::String::ExternalOneByteStringResource {
 };
 
 
-class UC16VectorResource : public v8::String::ExternalStringResource {
+class UC16VectorResource :
+  public v8::String::ExternalStringResource,
+  public v8::String::TaintTrackingStringBufferImpl {
  public:
   explicit UC16VectorResource(i::Vector<const i::uc16> vector)
       : data_(vector) {}

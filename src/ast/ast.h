@@ -17,6 +17,7 @@
 #include "src/parsing/token.h"
 #include "src/runtime/runtime.h"
 #include "src/small-pointer-list.h"
+#include "src/taint_tracking.h"
 #include "src/types.h"
 #include "src/utils.h"
 
@@ -199,6 +200,9 @@ class AstNode: public ZoneObject {
   NodeType node_type() const { return node_type_; }
   int position() const { return position_; }
 
+  tainttracking::NodeLabel GetTaintTrackingLabel();
+  void SetTaintTrackingLabel(tainttracking::NodeLabel label);
+
 #ifdef DEBUG
   void Print(Isolate* isolate);
 #endif  // DEBUG
@@ -223,6 +227,8 @@ class AstNode: public ZoneObject {
   // Hidden to prevent accidental usage. It would have to load the
   // current zone from the TLS.
   void* operator new(size_t size);
+
+  tainttracking::NodeLabel taint_tracking_label_;
 
   friend class CaseClause;  // Generates AST IDs.
 
@@ -1529,6 +1535,7 @@ class RegExpLiteral final : public MaterializedLiteral {
   DECLARE_NODE_TYPE(RegExpLiteral)
 
   Handle<String> pattern() const { return pattern_->string(); }
+  const AstRawString* raw_pattern() const { return pattern_; }
   int flags() const { return flags_; }
 
  protected:
@@ -1913,6 +1920,11 @@ class Call final : public Expression {
 #ifdef DEBUG
   // Used to assert that the FullCodeGenerator records the return site.
   bool return_is_recorded_;
+
+  // Used to assert that the taint tracking records all function arguments
+  int symbolized_args_;
+
+  bool symbolized_enter_is_recorded_;
 #endif
 
  protected:

@@ -31,8 +31,17 @@ void AstNode::Print(Isolate* isolate) {
   AstPrinter::PrintOut(isolate, this);
 }
 
-
 #endif  // DEBUG
+
+
+tainttracking::NodeLabel AstNode::GetTaintTrackingLabel() {
+  return taint_tracking_label_;
+}
+
+void AstNode::SetTaintTrackingLabel(tainttracking::NodeLabel label) {
+  taint_tracking_label_ = label;
+}
+
 
 #define RETURN_NODE(Node) \
   case k##Node:           \

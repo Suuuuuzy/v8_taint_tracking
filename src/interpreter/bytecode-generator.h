@@ -90,13 +90,13 @@ class BytecodeGenerator final : public AstVisitor<BytecodeGenerator> {
   void VisitPropertyLoad(Register obj, Property* expr);
   void VisitPropertyLoadForAccumulator(Register obj, Property* expr);
 
-  void VisitVariableLoad(Variable* variable, FeedbackVectorSlot slot,
+  void VisitVariableLoad(VariableProxy* proxy,
                          TypeofMode typeof_mode = NOT_INSIDE_TYPEOF);
   void VisitVariableLoadForAccumulatorValue(
-      Variable* variable, FeedbackVectorSlot slot,
+      VariableProxy* proxy,
       TypeofMode typeof_mode = NOT_INSIDE_TYPEOF);
   MUST_USE_RESULT Register
-  VisitVariableLoadForRegisterValue(Variable* variable, FeedbackVectorSlot slot,
+  VisitVariableLoadForRegisterValue(VariableProxy* proxy,
                                     TypeofMode typeof_mode = NOT_INSIDE_TYPEOF);
   void VisitVariableAssignment(Variable* variable, Token::Value op,
                                FeedbackVectorSlot slot);
@@ -202,6 +202,16 @@ class BytecodeGenerator final : public AstVisitor<BytecodeGenerator> {
   inline LanguageMode language_mode() const;
   int feedback_index(FeedbackVectorSlot slot) const;
 
+
+  void GenerateTaintTrackingHook(AstNode* node);
+  void GenerateTaintTrackingHook(
+      tainttracking::ValueState optimizedout, AstNode* node);
+  void GenerateTaintTrackingHookBody(
+      AstNode* node, tainttracking::CheckType type);
+  tainttracking::Status GenerateTaintTrackingHookPrepare(
+      AstNode* node, Handle<Object>* label);
+
+
   Isolate* isolate_;
   Zone* zone_;
   BytecodeArrayBuilder* builder_;
@@ -219,6 +229,9 @@ class BytecodeGenerator final : public AstVisitor<BytecodeGenerator> {
   ZoneVector<BytecodeLabel> generator_resume_points_;
   Register generator_state_;
   int loop_depth_;
+
+
+  tainttracking::V8NodeLabelSerializer node_serializer_;
 };
 
 }  // namespace interpreter

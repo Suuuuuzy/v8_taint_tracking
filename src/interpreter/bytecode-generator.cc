@@ -622,7 +622,8 @@ BytecodeGenerator::BytecodeGenerator(CompilationInfo* info)
       register_allocator_(nullptr),
       generator_resume_points_(info->literal()->yield_count(), info->zone()),
       generator_state_(),
-      loop_depth_(0) {
+      loop_depth_(0),
+      node_serializer_(isolate_) {
   InitializeAstVisitor(isolate()->stack_guard()->real_climit());
 }
 
@@ -1399,6 +1400,7 @@ void BytecodeGenerator::VisitFunctionLiteral(FunctionLiteral* expr) {
   size_t entry = builder()->AllocateConstantPoolEntry();
   builder()->CreateClosure(entry, flags);
   function_literals_.push_back(std::make_pair(expr, entry));
+  GenerateTaintTrackingHook(expr);
   execution_result()->SetResultInAccumulator();
 }
 
@@ -1426,6 +1428,7 @@ void BytecodeGenerator::VisitClassLiteral(ClassLiteral* expr) {
                                   : FeedbackVectorSlot::Invalid();
     VisitVariableAssignment(var, Token::INIT, slot);
   }
+  GenerateTaintTrackingHook(expr);
   execution_result()->SetResultInAccumulator();
 }
 
@@ -1543,12 +1546,18 @@ void BytecodeGenerator::VisitNativeFunctionLiteral(
   size_t entry = builder()->AllocateConstantPoolEntry();
   builder()->CreateClosure(entry, NOT_TENURED);
   native_function_literals_.push_back(std::make_pair(expr, entry));
+  GenerateTaintTrackingHook(expr);
   execution_result()->SetResultInAccumulator();
 }
 
 void BytecodeGenerator::VisitDoExpression(DoExpression* expr) {
   VisitBlock(expr->block());
-  VisitVariableProxy(expr->result());
+  {
+    AccumulatorResultScope in_accum(this);
+    VisitVariableProxy(expr->result());
+    GenerateTaintTrackingHook(expr);
+  }
+  execution_result()->SetResultInAccumulator();
 }
 
 void BytecodeGenerator::VisitConditional(Conditional* expr) {
@@ -1568,6 +1577,7 @@ void BytecodeGenerator::VisitConditional(Conditional* expr) {
   VisitForAccumulatorValue(expr->else_expression());
   builder()->Bind(&end_label);
 
+  GenerateTaintTrackingHook(expr);
   execution_result()->SetResultInAccumulator();
 }
 
@@ -1589,7 +1599,10 @@ void BytecodeGenerator::VisitLiteral(Literal* expr) {
     } else {
       builder()->LoadLiteral(raw_value->value());
     }
+    GenerateTaintTrackingHook(expr);
     execution_result()->SetResultInAccumulator();
+  } else {
+    GenerateTaintTrackingHook(tainttracking::ValueState::OPTIMIZED_OUT, expr);
   }
 }
 
@@ -1597,6 +1610,7 @@ void BytecodeGenerator::VisitRegExpLiteral(RegExpLiteral* expr) {
   // Materialize a regular expression literal.
   builder()->CreateRegExpLiteral(expr->pattern(), expr->literal_index(),
                                  expr->flags());
+  GenerateTaintTrackingHook(expr);
   execution_result()->SetResultInAccumulator();
 }
 
@@ -1792,7 +1806,9 @@ void BytecodeGenerator::VisitObjectLiteral(ObjectLiteral* expr) {
     }
   }
 
-  execution_result()->SetResultInRegister(literal);
+  builder()->LoadAccumulatorWithRegister(literal);
+  GenerateTaintTrackingHook(expr);
+  execution_result()->SetResultInAccumulator();
 }
 
 void BytecodeGenerator::VisitArrayLiteral(ArrayLiteral* expr) {
@@ -1831,12 +1847,13 @@ void BytecodeGenerator::VisitArrayLiteral(ArrayLiteral* expr) {
     // Restore literal array into accumulator.
     builder()->LoadAccumulatorWithRegister(literal);
   }
+  GenerateTaintTrackingHook(expr);
   execution_result()->SetResultInAccumulator();
 }
 
 void BytecodeGenerator::VisitVariableProxy(VariableProxy* proxy) {
   builder()->SetExpressionPosition(proxy);
-  VisitVariableLoad(proxy->var(), proxy->VariableFeedbackSlot());
+  VisitVariableLoad(proxy);
 }
 
 void BytecodeGenerator::BuildHoleCheckForVariableLoad(Variable* variable) {
@@ -1845,14 +1862,16 @@ void BytecodeGenerator::BuildHoleCheckForVariableLoad(Variable* variable) {
   }
 }
 
-void BytecodeGenerator::VisitVariableLoad(Variable* variable,
-                                          FeedbackVectorSlot slot,
+void BytecodeGenerator::VisitVariableLoad(VariableProxy* proxy,
                                           TypeofMode typeof_mode) {
+  Variable* variable = proxy->var();
+  FeedbackVectorSlot slot = proxy->VariableFeedbackSlot();
   switch (variable->location()) {
     case VariableLocation::LOCAL: {
       Register source(Register(variable->index()));
       builder()->LoadAccumulatorWithRegister(source);
       BuildHoleCheckForVariableLoad(variable);
+      GenerateTaintTrackingHook(proxy);
       execution_result()->SetResultInAccumulator();
       break;
     }
@@ -1862,12 +1881,14 @@ void BytecodeGenerator::VisitVariableLoad(Variable* variable,
       Register source = builder()->Parameter(variable->index() + 1);
       builder()->LoadAccumulatorWithRegister(source);
       BuildHoleCheckForVariableLoad(variable);
+      GenerateTaintTrackingHook(proxy);
       execution_result()->SetResultInAccumulator();
       break;
     }
     case VariableLocation::GLOBAL:
     case VariableLocation::UNALLOCATED: {
       builder()->LoadGlobal(feedback_index(slot), typeof_mode);
+      GenerateTaintTrackingHook(proxy);
       execution_result()->SetResultInAccumulator();
       break;
     }
@@ -1896,11 +1917,13 @@ void BytecodeGenerator::VisitVariableLoad(Variable* variable,
 
       builder()->LoadContextSlot(context_reg, variable->index());
       BuildHoleCheckForVariableLoad(variable);
+      GenerateTaintTrackingHook(proxy);
       execution_result()->SetResultInAccumulator();
       break;
     }
     case VariableLocation::LOOKUP: {
       builder()->LoadLookupSlot(variable->name(), typeof_mode);
+      GenerateTaintTrackingHook(proxy);
       execution_result()->SetResultInAccumulator();
       break;
     }
@@ -1908,15 +1931,17 @@ void BytecodeGenerator::VisitVariableLoad(Variable* variable,
 }
 
 void BytecodeGenerator::VisitVariableLoadForAccumulatorValue(
-    Variable* variable, FeedbackVectorSlot slot, TypeofMode typeof_mode) {
+    VariableProxy* proxy,
+    TypeofMode typeof_mode) {
   AccumulatorResultScope accumulator_result(this);
-  VisitVariableLoad(variable, slot, typeof_mode);
+  VisitVariableLoad(proxy, typeof_mode);
 }
 
 Register BytecodeGenerator::VisitVariableLoadForRegisterValue(
-    Variable* variable, FeedbackVectorSlot slot, TypeofMode typeof_mode) {
+    VariableProxy* proxy,
+    TypeofMode typeof_mode) {
   RegisterResultScope register_scope(this);
-  VisitVariableLoad(variable, slot, typeof_mode);
+  VisitVariableLoad(proxy, typeof_mode);
   return register_scope.ResultRegister();
 }
 
@@ -2202,8 +2227,7 @@ void BytecodeGenerator::VisitAssignment(Assignment* expr) {
     switch (assign_type) {
       case VARIABLE: {
         VariableProxy* proxy = expr->target()->AsVariableProxy();
-        old_value = VisitVariableLoadForRegisterValue(
-            proxy->var(), proxy->VariableFeedbackSlot());
+        old_value = VisitVariableLoadForRegisterValue(proxy);
         break;
       }
       case NAMED_PROPERTY: {
@@ -2273,6 +2297,8 @@ void BytecodeGenerator::VisitAssignment(Assignment* expr) {
       break;
     }
   }
+
+  GenerateTaintTrackingHook(expr);
   execution_result()->SetResultInAccumulator();
 }
 
@@ -2351,10 +2377,13 @@ void BytecodeGenerator::VisitYield(Yield* expr) {
     builder()->Bind(&resume_with_next);
     builder()->LoadAccumulatorWithRegister(input);
   }
+  GenerateTaintTrackingHook(expr);
   execution_result()->SetResultInAccumulator();
 }
 
 void BytecodeGenerator::VisitThrow(Throw* expr) {
+  // TODO: taint checking should be aware of the throw
+
   VisitForAccumulatorValue(expr->exception());
   builder()->SetExpressionPosition(expr);
   builder()->Throw();
@@ -2373,6 +2402,8 @@ void BytecodeGenerator::VisitPropertyLoad(Register obj, Property* expr) {
     case VARIABLE:
       UNREACHABLE();
     case NAMED_PROPERTY: {
+      GenerateTaintTrackingHook(
+          tainttracking::ValueState::STATIC_VALUE, expr->key());
       builder()->LoadNamedProperty(obj,
                                    expr->key()->AsLiteral()->AsPropertyName(),
                                    feedback_index(slot));
@@ -2390,6 +2421,7 @@ void BytecodeGenerator::VisitPropertyLoad(Register obj, Property* expr) {
       VisitKeyedSuperPropertyLoad(expr, Register::invalid_value());
       break;
   }
+  GenerateTaintTrackingHook(expr);
   execution_result()->SetResultInAccumulator();
 }
 
@@ -2521,8 +2553,7 @@ void BytecodeGenerator::VisitCall(Call* expr) {
       builder()->LoadUndefined().StoreAccumulatorInRegister(receiver);
       // Load callee as a global variable.
       VariableProxy* proxy = callee_expr->AsVariableProxy();
-      VisitVariableLoadForAccumulatorValue(proxy->var(),
-                                           proxy->VariableFeedbackSlot());
+      VisitVariableLoadForAccumulatorValue(proxy);
       builder()->StoreAccumulatorInRegister(callee);
       break;
     }
@@ -2622,6 +2653,7 @@ void BytecodeGenerator::VisitCall(Call* expr) {
   }
   builder()->Call(callee, receiver, 1 + args->length(), feedback_slot_index,
                   expr->tail_call_mode());
+  GenerateTaintTrackingHook(expr);
   execution_result()->SetResultInAccumulator();
 }
 
@@ -2666,6 +2698,7 @@ void BytecodeGenerator::VisitCallNew(CallNew* expr) {
   builder()
       ->LoadAccumulatorWithRegister(constructor)
       .New(constructor, first_arg, args->length());
+  GenerateTaintTrackingHook(expr);
   execution_result()->SetResultInAccumulator();
 }
 
@@ -2686,12 +2719,14 @@ void BytecodeGenerator::VisitCallRuntime(CallRuntime* expr) {
     Runtime::FunctionId function_id = expr->function()->function_id;
     builder()->CallRuntime(function_id, first_arg, args->length());
   }
+  GenerateTaintTrackingHook(expr);
   execution_result()->SetResultInAccumulator();
 }
 
 void BytecodeGenerator::VisitVoid(UnaryOperation* expr) {
   VisitForEffect(expr->expression());
   builder()->LoadUndefined();
+  GenerateTaintTrackingHook(expr);
   execution_result()->SetResultInAccumulator();
 }
 
@@ -2700,18 +2735,19 @@ void BytecodeGenerator::VisitTypeOf(UnaryOperation* expr) {
     // Typeof does not throw a reference error on global variables, hence we
     // perform a non-contextual load in case the operand is a variable proxy.
     VariableProxy* proxy = expr->expression()->AsVariableProxy();
-    VisitVariableLoadForAccumulatorValue(
-        proxy->var(), proxy->VariableFeedbackSlot(), INSIDE_TYPEOF);
+    VisitVariableLoadForAccumulatorValue(proxy, INSIDE_TYPEOF);
   } else {
     VisitForAccumulatorValue(expr->expression());
   }
   builder()->TypeOf();
+  GenerateTaintTrackingHook(expr);
   execution_result()->SetResultInAccumulator();
 }
 
 void BytecodeGenerator::VisitNot(UnaryOperation* expr) {
   VisitForAccumulatorValue(expr->expression());
   builder()->LogicalNot();
+  GenerateTaintTrackingHook(expr);
   execution_result()->SetResultInAccumulator();
 }
 
@@ -2798,6 +2834,7 @@ void BytecodeGenerator::VisitDelete(UnaryOperation* expr) {
     VisitForEffect(expr->expression());
     builder()->LoadTrue();
   }
+  GenerateTaintTrackingHook(expr);
   execution_result()->SetResultInAccumulator();
 }
 
@@ -2816,8 +2853,7 @@ void BytecodeGenerator::VisitCountOperation(CountOperation* expr) {
   switch (assign_type) {
     case VARIABLE: {
       VariableProxy* proxy = expr->expression()->AsVariableProxy();
-      VisitVariableLoadForAccumulatorValue(proxy->var(),
-                                           proxy->VariableFeedbackSlot());
+      VisitVariableLoadForAccumulatorValue(proxy);
       break;
     }
     case NAMED_PROPERTY: {
@@ -2915,10 +2951,10 @@ void BytecodeGenerator::VisitCountOperation(CountOperation* expr) {
 
   // Restore old value for postfix expressions.
   if (is_postfix) {
-    execution_result()->SetResultInRegister(old_value);
-  } else {
-    execution_result()->SetResultInAccumulator();
+    builder()->LoadAccumulatorWithRegister(old_value);
   }
+  GenerateTaintTrackingHook(expr);
+  execution_result()->SetResultInAccumulator();
 }
 
 void BytecodeGenerator::VisitBinaryOperation(BinaryOperation* binop) {
@@ -2943,6 +2979,7 @@ void BytecodeGenerator::VisitCompareOperation(CompareOperation* expr) {
   VisitForAccumulatorValue(expr->right());
   builder()->SetExpressionPosition(expr);
   builder()->CompareOperation(expr->op(), lhs);
+  GenerateTaintTrackingHook(expr);
   execution_result()->SetResultInAccumulator();
 }
 
@@ -2952,6 +2989,7 @@ void BytecodeGenerator::VisitArithmeticExpression(BinaryOperation* expr) {
   Register lhs = VisitForRegisterValue(expr->left());
   VisitForAccumulatorValue(expr->right());
   builder()->BinaryOperation(expr->op(), lhs);
+  GenerateTaintTrackingHook(expr);
   execution_result()->SetResultInAccumulator();
 }
 
@@ -2962,7 +3000,9 @@ void BytecodeGenerator::VisitEmptyParentheses(EmptyParentheses* expr) {
 }
 
 void BytecodeGenerator::VisitThisFunction(ThisFunction* expr) {
-  execution_result()->SetResultInRegister(Register::function_closure());
+  builder()->LoadAccumulatorWithRegister(Register::function_closure());
+  GenerateTaintTrackingHook(expr);
+  execution_result()->SetResultInAccumulator();
 }
 
 void BytecodeGenerator::VisitSuperCallReference(SuperCallReference* expr) {
@@ -2973,6 +3013,7 @@ void BytecodeGenerator::VisitSuperCallReference(SuperCallReference* expr) {
 void BytecodeGenerator::VisitSuperPropertyReference(
     SuperPropertyReference* expr) {
   builder()->CallRuntime(Runtime::kThrowUnsupportedSuperError, Register(0), 0);
+  GenerateTaintTrackingHook(expr);
   execution_result()->SetResultInAccumulator();
 }
 
@@ -2996,6 +3037,7 @@ void BytecodeGenerator::VisitLogicalOrExpression(BinaryOperation* binop) {
     VisitForAccumulatorValue(right);
     builder()->Bind(&end_label);
   }
+  GenerateTaintTrackingHook(binop);
   execution_result()->SetResultInAccumulator();
 }
 
@@ -3014,6 +3056,7 @@ void BytecodeGenerator::VisitLogicalAndExpression(BinaryOperation* binop) {
     VisitForAccumulatorValue(right);
     builder()->Bind(&end_label);
   }
+  GenerateTaintTrackingHook(binop);
   execution_result()->SetResultInAccumulator();
 }
 
@@ -3269,6 +3312,68 @@ LanguageMode BytecodeGenerator::language_mode() const {
 int BytecodeGenerator::feedback_index(FeedbackVectorSlot slot) const {
   return TypeFeedbackVector::GetIndex(slot);
 }
+
+
+
+tainttracking::Status
+BytecodeGenerator::GenerateTaintTrackingHookPrepare(
+    AstNode* node, Handle<Object>* label) {
+  if (!tainttracking::TaintTracker::FromIsolate(isolate_)->
+      IsRewriteAstEnabled()) {
+    return tainttracking::Status::FAILURE;
+  }
+
+  return node_serializer_.Serialize(label, node->GetTaintTrackingLabel());
+}
+
+void BytecodeGenerator::GenerateTaintTrackingHookBody(
+    AstNode* node, tainttracking::CheckType type) {
+  Handle<Object> label_value;
+  if (!GenerateTaintTrackingHookPrepare(node, &label_value)) {
+    return;
+  }
+
+  register_allocator()->PrepareForConsecutiveAllocations(
+      tainttracking::kRuntimeOnControlFlowExpArgs);
+
+  // Visit for first argument that goes into returned register
+  Register first_arg = register_allocator()->NextConsecutiveRegister();
+  builder()->StoreAccumulatorInRegister(first_arg);
+  Register label_arg = register_allocator()->NextConsecutiveRegister();
+
+
+  builder()->LoadLiteral(label_value);
+  builder()->StoreAccumulatorInRegister(label_arg);
+
+  Register check_type_arg = register_allocator()->NextConsecutiveRegister();
+  builder()->LoadLiteral(Smi::FromInt(type));
+  builder()->StoreAccumulatorInRegister(check_type_arg);
+
+  EffectResultScope effect_scope(this);
+  builder()->CallRuntime(Runtime::kTaintTrackingHook,
+                         first_arg,
+                         tainttracking::kRuntimeOnControlFlowExpArgs);
+}
+
+// Value is in the accumulator
+void BytecodeGenerator::GenerateTaintTrackingHook(AstNode* node) {
+  GenerateTaintTrackingHookBody(
+      node, tainttracking::CheckType::EXPRESSION_AFTER);
+}
+
+void BytecodeGenerator::GenerateTaintTrackingHook(
+    tainttracking::ValueState optimizedout, AstNode* expr) {
+  builder()->LoadUndefined();
+  if (optimizedout == tainttracking::ValueState::OPTIMIZED_OUT) {
+    GenerateTaintTrackingHookBody(
+        expr, tainttracking::CheckType::EXPRESSION_AFTER_OPTIMIZED_OUT);
+  } else {
+    DCHECK(optimizedout == tainttracking::ValueState::STATIC_VALUE);
+    GenerateTaintTrackingHookBody(
+        expr, tainttracking::CheckType::STATIC_VALUE_CHECK);
+  }
+}
+
 
 }  // namespace interpreter
 }  // namespace internal

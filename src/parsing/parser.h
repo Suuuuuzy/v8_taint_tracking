@@ -14,6 +14,7 @@
 #include "src/parsing/preparse-data-format.h"
 #include "src/parsing/preparser.h"
 #include "src/pending-compilation-error-handler.h"
+#include "src/taint_tracking.h"
 
 namespace v8 {
 
@@ -147,6 +148,11 @@ class ParseInfo {
     start_position_ = start_position;
   }
 
+  int function_token_position() const { return function_token_position_; }
+  void set_function_token_position(int position) {
+    function_token_position_ = position;
+  }
+
   int end_position() const { return end_position_; }
   void set_end_position(int end_position) { end_position_ = end_position; }
 
@@ -225,6 +231,7 @@ class ParseInfo {
   int compiler_hints_;
   int start_position_;
   int end_position_;
+  int function_token_position_;
 
   // TODO(titzer): Move handles and isolate out of ParseInfo.
   Isolate* isolate_;
@@ -1155,6 +1162,9 @@ class Parser : public ParserBase<ParserTraits> {
   V8_INLINE void RewriteNonPattern(ExpressionClassifier* classifier, bool* ok);
 
   friend class InitializerRewriter;
+
+  friend class tainttracking::AstSerializer;
+
   void RewriteParameterInitializer(Expression* expr, Scope* scope);
 
   Expression* BuildCreateJSGeneratorObject(int pos, FunctionKind kind);

@@ -7,6 +7,7 @@
 
 #include "src/compiler.h"
 #include "src/uri.h"
+#include "src/taint_tracking.h"
 
 namespace v8 {
 namespace internal {
@@ -85,11 +86,17 @@ BUILTIN(GlobalEval) {
   Handle<JSFunction> target = args.target<JSFunction>();
   Handle<JSObject> target_global_proxy(target->global_proxy(), isolate);
   if (!x->IsString()) return *x;
+
+  tainttracking::LogIfTainted(Handle<String>::cast(x),
+                              tainttracking::TaintSinkLabel::JAVASCRIPT,
+                              0);
+
   if (!Builtins::AllowDynamicFunction(isolate, target, target_global_proxy)) {
     isolate->CountUsage(v8::Isolate::kFunctionConstructorReturnedUndefined);
     return isolate->heap()->undefined_value();
   }
   Handle<JSFunction> function;
+
   ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
       isolate, function, Compiler::GetFunctionFromString(
                              handle(target->native_context(), isolate),
@@ -97,6 +104,36 @@ BUILTIN(GlobalEval) {
   RETURN_RESULT_OR_FAILURE(
       isolate,
       Execution::Call(isolate, function, target_global_proxy, 0, nullptr));
+}
+
+BUILTIN(GlobalPrintToTaintLog) {
+  HandleScope scope(isolate);
+  Handle<String> string;
+  Handle<String> extra;
+  ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
+      isolate, string,
+      Object::ToString(isolate, args.atOrUndefined(isolate, 1)));
+  ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
+      isolate, extra,
+      Object::ToString(isolate, args.atOrUndefined(isolate, 2)));
+  tainttracking::JSTaintLog(string, extra);
+  return isolate->heap()->undefined_value();
+}
+
+BUILTIN(GlobalTaintConstants) {
+  HandleScope scope(isolate);
+  return *tainttracking::JSTaintConstants(isolate);
+}
+
+BUILTIN(GlobalSetTaint) {
+  HandleScope scope(isolate);
+  uint32_t taint_value;
+  if (args.atOrUndefined(isolate, 2)->ToUint32(&taint_value)) {
+    tainttracking::SetTaint(
+        args.atOrUndefined(isolate, 1),
+        static_cast<tainttracking::TaintType>(taint_value));
+  }
+  return isolate->heap()->undefined_value();
 }
 
 }  // namespace internal

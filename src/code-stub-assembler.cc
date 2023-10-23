@@ -12,7 +12,9 @@
 namespace v8 {
 namespace internal {
 
+
 using compiler::Node;
+
 
 CodeStubAssembler::CodeStubAssembler(Isolate* isolate, Zone* zone,
                                      const CallInterfaceDescriptor& descriptor,
@@ -1235,14 +1237,42 @@ Node* CodeStubAssembler::AllocateHeapNumberWithValue(Node* value) {
   return result;
 }
 
+void CodeStubAssembler::IncrementAndStoreTaintInstanceCounter(Node* result) {
+  // tainttracking::InstanceCounter* counter =
+  //   tainttracking::TaintTracker::FromIsolate(isolate())->
+  //   symbolic_elem_counter();
+  // Node* address = ExternalConstant(ExternalReference(counter));
+  // Node* value = Load(MachineType::Int64(), address);
+  StoreObjectFieldNoWriteBarrier(result, Name::kTaintInfoOffset,
+                                 Int64Constant(Name::DEFAULT_TAINT_INFO),
+                                 MachineRepresentation::kWord64);
+  // if (Is64()) {
+  //   value = IntPtrAdd(value, Int64Constant(1));
+  // } else {
+  //   DCHECK(false);
+  // }
+  // StoreNoWriteBarrier(MachineRepresentation::kWord64, address, value);
+}
+
 Node* CodeStubAssembler::AllocateSeqOneByteString(int length) {
   Node* result = Allocate(SeqOneByteString::SizeFor(length));
+  Node* taint_start = IntPtrAdd(
+      IntPtrConstant(SeqOneByteString::kHeaderSize - kHeapObjectTag),
+      IntPtrConstant(length));
   StoreMapNoWriteBarrier(result, LoadRoot(Heap::kOneByteStringMapRootIndex));
   StoreObjectFieldNoWriteBarrier(result, SeqOneByteString::kLengthOffset,
                                  SmiConstant(Smi::FromInt(length)));
   StoreObjectFieldNoWriteBarrier(result, SeqOneByteString::kHashFieldOffset,
                                  IntPtrConstant(String::kEmptyHashField),
                                  MachineRepresentation::kWord32);
+  IncrementAndStoreTaintInstanceCounter(result);
+  for (int i = 0; i < length; i++) {
+    StoreNoWriteBarrier(
+        MachineRepresentation::kWord8,
+        result,
+        IntPtrAdd(taint_start, IntPtrConstant(i)),
+        IntPtrConstant(0));
+  }
   return result;
 }
 
@@ -1252,26 +1282,55 @@ Node* CodeStubAssembler::AllocateSeqOneByteString(Node* context, Node* length) {
   // Compute the SeqOneByteString size and check if it fits into new space.
   Label if_sizeissmall(this), if_notsizeissmall(this, Label::kDeferred),
       if_join(this);
+
   Node* size = WordAnd(
       IntPtrAdd(
-          IntPtrAdd(length, IntPtrConstant(SeqOneByteString::kHeaderSize)),
+          // Taint needs 2 * length
+          IntPtrAdd(WordShl(length, 1),
+                    IntPtrConstant(SeqOneByteString::kHeaderSize)),
           IntPtrConstant(kObjectAlignmentMask)),
       IntPtrConstant(~kObjectAlignmentMask));
-  Branch(IntPtrLessThanOrEqual(size,
-                               IntPtrConstant(Page::kMaxRegularHeapObjectSize)),
-         &if_sizeissmall, &if_notsizeissmall);
+  Branch(
+      IntPtrLessThanOrEqual(
+          size, IntPtrConstant(Page::kMaxRegularHeapObjectSize)),
+      &if_sizeissmall, &if_notsizeissmall);
 
   Bind(&if_sizeissmall);
   {
     // Just allocate the SeqOneByteString in new space.
     Node* result = Allocate(size);
+    Node* taint_start = IntPtrAdd(
+        IntPtrConstant(SeqOneByteString::kHeaderSize - kHeapObjectTag),
+        length);
     StoreMapNoWriteBarrier(result, LoadRoot(Heap::kOneByteStringMapRootIndex));
     StoreObjectFieldNoWriteBarrier(result, SeqOneByteString::kLengthOffset,
                                    SmiFromWord(length));
     StoreObjectFieldNoWriteBarrier(result, SeqOneByteString::kHashFieldOffset,
                                    IntPtrConstant(String::kEmptyHashField),
                                    MachineRepresentation::kWord32);
+    IncrementAndStoreTaintInstanceCounter(result);
+    Variable var_offset(this, MachineType::PointerRepresentation());
+    Label loop(this, &var_offset), done_loop(this);
+    var_offset.Bind(IntPtrConstant(0));
     var_result.Bind(result);
+    Goto(&loop);
+
+    Bind(&loop);
+    {
+      // Here we zero out the taint to initialize it
+      Node* offset = var_offset.value();
+      GotoIf(WordEqual(offset, length), &done_loop);
+      StoreNoWriteBarrier(
+        MachineRepresentation::kWord8,
+        result,
+        IntPtrAdd(taint_start, offset),
+        IntPtrConstant(0));
+      var_offset.Bind(IntPtrAdd(offset, IntPtrConstant(1)));
+      Goto(&loop);
+    }
+
+
+    Bind(&done_loop);
     Goto(&if_join);
   }
 
@@ -1290,12 +1349,24 @@ Node* CodeStubAssembler::AllocateSeqOneByteString(Node* context, Node* length) {
 
 Node* CodeStubAssembler::AllocateSeqTwoByteString(int length) {
   Node* result = Allocate(SeqTwoByteString::SizeFor(length));
+  Node* taint_start = IntPtrAdd(
+      IntPtrConstant(SeqTwoByteString::kHeaderSize - kHeapObjectTag),
+      IntPtrConstant(length * kShortSize));
   StoreMapNoWriteBarrier(result, LoadRoot(Heap::kStringMapRootIndex));
   StoreObjectFieldNoWriteBarrier(result, SeqTwoByteString::kLengthOffset,
                                  SmiConstant(Smi::FromInt(length)));
   StoreObjectFieldNoWriteBarrier(result, SeqTwoByteString::kHashFieldOffset,
                                  IntPtrConstant(String::kEmptyHashField),
                                  MachineRepresentation::kWord32);
+  IncrementAndStoreTaintInstanceCounter(result);
+  for (int i = 0; i < length; i++) {
+    StoreNoWriteBarrier(
+        MachineRepresentation::kWord8,
+        result,
+        IntPtrAdd(taint_start, IntPtrConstant(i)),
+        IntPtrConstant(0));
+  }
+
   return result;
 }
 
@@ -1305,25 +1376,56 @@ Node* CodeStubAssembler::AllocateSeqTwoByteString(Node* context, Node* length) {
   // Compute the SeqTwoByteString size and check if it fits into new space.
   Label if_sizeissmall(this), if_notsizeissmall(this, Label::kDeferred),
       if_join(this);
+
   Node* size = WordAnd(
-      IntPtrAdd(IntPtrAdd(WordShl(length, 1),
-                          IntPtrConstant(SeqTwoByteString::kHeaderSize)),
+      IntPtrAdd(
+          // Taint needs length + length * 2
+          IntPtrAdd(
+              IntPtrAdd(WordShl(length, 1),
+                        IntPtrConstant(SeqTwoByteString::kHeaderSize)),
+              length),
                 IntPtrConstant(kObjectAlignmentMask)),
       IntPtrConstant(~kObjectAlignmentMask));
-  Branch(IntPtrLessThanOrEqual(size,
-                               IntPtrConstant(Page::kMaxRegularHeapObjectSize)),
-         &if_sizeissmall, &if_notsizeissmall);
+  Branch(
+      IntPtrLessThanOrEqual(
+          size, IntPtrConstant(Page::kMaxRegularHeapObjectSize)),
+      &if_sizeissmall, &if_notsizeissmall);
 
   Bind(&if_sizeissmall);
   {
     // Just allocate the SeqTwoByteString in new space.
     Node* result = Allocate(size);
+    Node* taint_start = IntPtrAdd(
+        IntPtrConstant(SeqTwoByteString::kHeaderSize - kHeapObjectTag),
+        WordShl(length, 1));
     StoreMapNoWriteBarrier(result, LoadRoot(Heap::kStringMapRootIndex));
     StoreObjectFieldNoWriteBarrier(result, SeqTwoByteString::kLengthOffset,
                                    SmiFromWord(length));
     StoreObjectFieldNoWriteBarrier(result, SeqTwoByteString::kHashFieldOffset,
                                    IntPtrConstant(String::kEmptyHashField),
                                    MachineRepresentation::kWord32);
+    IncrementAndStoreTaintInstanceCounter(result);
+    Variable var_offset(this, MachineType::PointerRepresentation());
+    Label loop(this, &var_offset), done_loop(this);
+    var_offset.Bind(IntPtrConstant(0));
+    var_result.Bind(result);
+    Goto(&loop);
+
+    Bind(&loop);
+    {
+      Node* offset = var_offset.value();
+      GotoIf(WordEqual(offset, length), &done_loop);
+      StoreNoWriteBarrier(
+        MachineRepresentation::kWord8,
+        result,
+        IntPtrAdd(taint_start, offset),
+        IntPtrConstant(0));
+      var_offset.Bind(IntPtrAdd(offset, IntPtrConstant(1)));
+      Goto(&loop);
+    }
+
+    Bind(&done_loop);
+
     var_result.Bind(result);
     Goto(&if_join);
   }
@@ -2184,13 +2286,20 @@ Node* CodeStubAssembler::StringFromCharCode(Node* code) {
     Bind(&if_entryisundefined);
     {
       // Allocate a new SeqOneByteString for {code} and store it in the {cache}.
-      Node* result = AllocateSeqOneByteString(1);
-      StoreNoWriteBarrier(
-          MachineRepresentation::kWord8, result,
+    Node* result = AllocateSeqOneByteString(1);
+    StoreNoWriteBarrier(
+        MachineRepresentation::kWord8, result,
           IntPtrConstant(SeqOneByteString::kHeaderSize - kHeapObjectTag), code);
+    // Init taint
+    StoreNoWriteBarrier(
+        MachineRepresentation::kWord8, result,
+        IntPtrConstant(SeqOneByteString::kHeaderSize -
+                       kHeapObjectTag +
+                       kCharSize),
+        IntPtrConstant(0));
       StoreFixedArrayElement(cache, code, result);
-      var_result.Bind(result);
-      Goto(&if_done);
+    var_result.Bind(result);
+    Goto(&if_done);
     }
 
     Bind(&if_entryisnotundefined);
@@ -2208,6 +2317,13 @@ Node* CodeStubAssembler::StringFromCharCode(Node* code) {
     StoreNoWriteBarrier(
         MachineRepresentation::kWord16, result,
         IntPtrConstant(SeqTwoByteString::kHeaderSize - kHeapObjectTag), code);
+    // Init taint
+    StoreNoWriteBarrier(
+        MachineRepresentation::kWord16, result,
+        IntPtrConstant(SeqTwoByteString::kHeaderSize -
+                       kHeapObjectTag +
+                       kShortSize),
+        IntPtrConstant(0));
     var_result.Bind(result);
     Goto(&if_done);
   }

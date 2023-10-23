@@ -15,6 +15,7 @@
 #include "src/isolate-inl.h"
 #include "src/messages.h"
 #include "src/parsing/parser.h"
+#include "src/taint_tracking.h"
 #include "src/wasm/wasm-module.h"
 
 namespace v8 {
@@ -578,6 +579,248 @@ RUNTIME_FUNCTION(Runtime_Typeof) {
   CONVERT_ARG_HANDLE_CHECKED(Object, object, 0);
   return *Object::TypeOf(isolate, object);
 }
+
+RUNTIME_FUNCTION(Runtime_TaintTrackingHook) {
+  HandleScope scope(isolate);
+
+  DCHECK_EQ(3, args.length());
+  CONVERT_ARG_HANDLE_CHECKED(Object, target, 0);
+  CONVERT_ARG_HANDLE_CHECKED(Object, label, 1);
+  CONVERT_ARG_HANDLE_CHECKED(Smi, checktype, 2);
+
+  tainttracking::RuntimeHook(
+      isolate,
+      target,
+      label,
+      checktype->value());
+  return *target;
+}
+
+RUNTIME_FUNCTION(Runtime_TaintTrackingLoadVariable) {
+  HandleScope scope(isolate);
+
+  DCHECK_EQ(4, args.length());
+  CONVERT_ARG_HANDLE_CHECKED(Object, target, 0);
+  CONVERT_ARG_HANDLE_CHECKED(Object, proxy_label, 1);
+  CONVERT_ARG_HANDLE_CHECKED(Object, past_assignment_label_or_idx, 2);
+  CONVERT_ARG_HANDLE_CHECKED(Smi, checktype, 3);
+
+  tainttracking::RuntimeHookVariableLoad(
+      isolate,
+      target,
+      proxy_label,
+      past_assignment_label_or_idx,
+      checktype->value());
+  return *target;
+}
+
+RUNTIME_FUNCTION(Runtime_TaintTrackingStoreVariable) {
+  HandleScope scope(isolate);
+
+  DCHECK(args.length() == 3 || args.length() == 4);
+  CONVERT_ARG_HANDLE_CHECKED(Object, concrete, 0);
+  CONVERT_ARG_HANDLE_CHECKED(Object, label, 1);
+  CONVERT_ARG_HANDLE_CHECKED(Smi, checktype, 2);
+  Handle<Object> idx_or_holder (
+      Smi::FromInt(tainttracking::NO_VARIABLE_INDEX), isolate);
+  if (args.length() == 4) {
+    idx_or_holder = args.at<Object>(3);
+  }
+
+  Handle<Object> ret = tainttracking::RuntimeHookVariableStore(
+      isolate,
+      concrete,
+      label,
+      static_cast<tainttracking::CheckType>(checktype->value()),
+      idx_or_holder);
+  return *ret;
+}
+
+RUNTIME_FUNCTION(Runtime_TaintTrackingStoreContextVariable) {
+  HandleScope scope(isolate);
+
+  DCHECK_EQ(4, args.length());
+  CONVERT_ARG_HANDLE_CHECKED(Object, concrete, 0);
+  CONVERT_ARG_HANDLE_CHECKED(Object, label, 1);
+  CONVERT_ARG_HANDLE_CHECKED(Context, context, 2);
+  CONVERT_ARG_HANDLE_CHECKED(Smi, index, 3);
+
+  tainttracking::RuntimeHookVariableContextStore(
+      isolate, concrete, label, context, index);
+  return isolate->heap()->undefined_value();
+}
+
+RUNTIME_FUNCTION(Runtime_TaintTrackingExitStackFrame) {
+  HandleScope scope(isolate);
+  DCHECK_EQ(0, args.length());
+  tainttracking::RuntimeExitSymbolicStackFrame(isolate);
+  return isolate->heap()->undefined_value();
+}
+
+RUNTIME_FUNCTION(Runtime_TaintTrackingPrepareFrame) {
+  HandleScope scope(isolate);
+  DCHECK_EQ(1, args.length());
+  CONVERT_ARG_HANDLE_CHECKED(Smi, frame_type, 0);
+  tainttracking::RuntimePrepareSymbolicStackFrame(
+      isolate,
+      static_cast<tainttracking::FrameType>(frame_type->value()));
+  return isolate->heap()->undefined_value();
+}
+
+RUNTIME_FUNCTION(Runtime_TaintTrackingEnterFrame) {
+  HandleScope scope(isolate);
+  DCHECK_EQ(0, args.length());
+  tainttracking::RuntimeEnterSymbolicStackFrame(isolate);
+  return isolate->heap()->undefined_value();
+}
+
+RUNTIME_FUNCTION(Runtime_TaintTrackingAddArgumentToFrame) {
+  HandleScope scope(isolate);
+  DCHECK_EQ(1, args.length());
+  CONVERT_ARG_HANDLE_CHECKED(Object, label, 0);
+  tainttracking::RuntimeAddArgumentToStackFrame(isolate, label);
+  return isolate->heap()->undefined_value();
+}
+
+
+RUNTIME_FUNCTION(Runtime_TaintTrackingSetReturnValue) {
+  HandleScope scope(isolate);
+  DCHECK(args.length() == 1 || args.length() == 2);
+  CONVERT_ARG_HANDLE_CHECKED(Object, value, 0);
+  MaybeHandle<Object> label;
+  if (args.length() > 1) {
+    label = args.at<Object>(1);
+  }
+  tainttracking::RuntimeSetReturnValue(isolate, value, label);
+  return isolate->heap()->undefined_value();
+}
+
+RUNTIME_FUNCTION(Runtime_TaintTrackingEnterTry) {
+  HandleScope scope(isolate);
+  DCHECK_EQ(args.length(), 1);
+  CONVERT_ARG_HANDLE_CHECKED(Object, label, 0);
+  tainttracking::RuntimeEnterTry(isolate, label);
+  return isolate->heap()->undefined_value();
+}
+
+RUNTIME_FUNCTION(Runtime_TaintTrackingExitTry) {
+  HandleScope scope(isolate);
+  DCHECK_EQ(args.length(), 1);
+  CONVERT_ARG_HANDLE_CHECKED(Object, label, 0);
+  tainttracking::RuntimeExitTry(isolate, label);
+  return isolate->heap()->undefined_value();
+}
+
+RUNTIME_FUNCTION(Runtime_TaintTrackingExitFinally) {
+  HandleScope scope(isolate);
+  DCHECK_EQ(args.length(), 0);
+  tainttracking::RuntimeOnExitFinally(isolate);
+  return isolate->heap()->undefined_value();
+}
+
+RUNTIME_FUNCTION(Runtime_TaintTrackingAddReceiver) {
+  HandleScope scope(isolate);
+  DCHECK_EQ(2, args.length());
+  CONVERT_ARG_HANDLE_CHECKED(Object, value, 0);
+  CONVERT_ARG_HANDLE_CHECKED(Object, label, 1);
+  tainttracking::RuntimeSetReceiver(isolate, value, label);
+  return isolate->heap()->undefined_value();
+}
+
+RUNTIME_FUNCTION(Runtime_TaintTrackingAddLiteralReceiver) {
+  HandleScope scope(isolate);
+  DCHECK_EQ(1, args.length());
+  CONVERT_ARG_HANDLE_CHECKED(Object, value, 0);
+  tainttracking::RuntimeSetLiteralReceiver(isolate, value);
+  return isolate->heap()->undefined_value();
+}
+
+
+
+RUNTIME_FUNCTION(Runtime_TaintTrackingPrepareApply) {
+  HandleScope scope(isolate);
+  DCHECK_EQ(5, args.length());
+
+  CONVERT_ARG_HANDLE_CHECKED(Object, arguments_list, 0);
+  CONVERT_ARG_HANDLE_CHECKED(Object, target_fn, 1);
+  CONVERT_ARG_HANDLE_CHECKED(Object, new_target, 2);
+  CONVERT_ARG_HANDLE_CHECKED(Object, this_argument, 3);
+  CONVERT_ARG_HANDLE_CHECKED(Smi, frame_type, 4);
+
+  return tainttracking::RuntimePrepareApplyFrame(
+      isolate,
+      arguments_list,
+      target_fn,
+      new_target,
+      this_argument,
+      static_cast<tainttracking::FrameType>(frame_type->value()));
+}
+
+RUNTIME_FUNCTION(Runtime_TaintTrackingPrepareCall) {
+  HandleScope scope(isolate);
+  static const int OTHER_ARGS = 2;
+
+  DCHECK_LE(OTHER_ARGS, args.length());
+
+  CONVERT_ARG_HANDLE_CHECKED(Object, target_fn, 0);
+  CONVERT_ARG_HANDLE_CHECKED(Smi, caller_frame_type, 1);
+
+  Handle<FixedArray> arg_list = isolate->factory()->NewFixedArray(
+      args.length() - OTHER_ARGS);
+  for (int i = OTHER_ARGS; i < args.length(); i++) {
+    arg_list->set(i - OTHER_ARGS, *(args.at<Object>(i)));
+  }
+
+  return tainttracking::RuntimePrepareCallFrame(
+      isolate,
+      target_fn,
+      static_cast<tainttracking::FrameType>(caller_frame_type->value()),
+      arg_list);
+}
+
+RUNTIME_FUNCTION(Runtime_TaintTrackingPrepareCallOrConstruct) {
+  HandleScope scope(isolate);
+
+  static const int OTHER_ARGS = 2;
+
+  DCHECK_LE(OTHER_ARGS, args.length());
+
+  CONVERT_ARG_HANDLE_CHECKED(Object, target_fn, 0);
+  CONVERT_ARG_HANDLE_CHECKED(Object, new_target, 1);
+
+  Handle<FixedArray> arg_list = isolate->factory()->NewFixedArray(
+      args.length() - OTHER_ARGS);
+  for (int i = OTHER_ARGS; i < args.length(); i++) {
+    arg_list->set(i - OTHER_ARGS, *(args.at<Object>(i)));
+  }
+
+  return tainttracking::RuntimePrepareCallOrConstructFrame(
+      isolate, target_fn, new_target, arg_list);
+}
+
+RUNTIME_FUNCTION(Runtime_TaintTrackingCheckMessageOrigin) {
+  HandleScope scope (isolate);
+  CONVERT_ARG_HANDLE_CHECKED(Object, left, 0);
+  CONVERT_ARG_HANDLE_CHECKED(Object, right, 1);
+  CONVERT_ARG_HANDLE_CHECKED(Smi, token, 2);
+
+  tainttracking::RuntimeCheckMessageOrigin(
+      isolate, left, right, static_cast<Token::Value>(token->value()));
+
+  return isolate->heap()->undefined_value();
+}
+
+RUNTIME_FUNCTION(Runtime_TaintTrackingParameterToContextStorage) {
+  HandleScope scope (isolate);
+  CONVERT_ARG_HANDLE_CHECKED(Smi, param_index, 0);
+  CONVERT_ARG_HANDLE_CHECKED(Smi, ctx_slot_index, 1);
+  CONVERT_ARG_HANDLE_CHECKED(Context, context, 2);
+
+  tainttracking::RuntimeParameterToContextStorage(
+      isolate, param_index->value(), ctx_slot_index->value(), context);
+  return isolate->heap()->undefined_value();
+}
+
 
 }  // namespace internal
 }  // namespace v8

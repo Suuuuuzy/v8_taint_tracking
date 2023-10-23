@@ -22,11 +22,12 @@ MaybeHandle<String> ReplacementStringBuilder::ToString() {
     ASSIGN_RETURN_ON_EXCEPTION(
         isolate, seq, isolate->factory()->NewRawOneByteString(character_count_),
         String);
-
     DisallowHeapAllocation no_gc;
     uint8_t* char_buffer = seq->GetChars();
     StringBuilderConcatHelper(*subject_, char_buffer, *array_builder_.array(),
-                              array_builder_.length());
+                              array_builder_.length(),
+                              tainttracking::GetWriteableStringTaintData(*seq));
+    tainttracking::OnJoinManyStrings(*seq, *array_builder_.array());
     joined_string = Handle<String>::cast(seq);
   } else {
     // Two-byte.
@@ -38,7 +39,9 @@ MaybeHandle<String> ReplacementStringBuilder::ToString() {
     DisallowHeapAllocation no_gc;
     uc16* char_buffer = seq->GetChars();
     StringBuilderConcatHelper(*subject_, char_buffer, *array_builder_.array(),
-                              array_builder_.length());
+                              array_builder_.length(),
+                              tainttracking::GetWriteableStringTaintData(*seq));
+    tainttracking::OnJoinManyStrings(*seq, *array_builder_.array());
     joined_string = Handle<String>::cast(seq);
   }
   return joined_string;
@@ -96,7 +99,15 @@ MaybeHandle<String> IncrementalStringBuilder::Finish() {
   if (overflowed_) {
     THROW_NEW_ERROR(isolate_, NewInvalidStringLengthError(), String);
   }
-  return accumulator();
+  MaybeHandle<String> answer = accumulator();
+  if (!answer.is_null()) {
+    {
+      DisallowHeapAllocation no_gc;
+      tainttracking::OnGenericOperation(
+          tainttracking::INCREMENTAL_BUILD, *(answer.ToHandleChecked()));
+    }
+  }
+  return answer;
 }
 
 

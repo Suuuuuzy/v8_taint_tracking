@@ -49,6 +49,7 @@ class ExternalReferenceTable {
   void AddStubCache(Isolate* isolate);
   void AddDeoptEntries(Isolate* isolate);
   void AddApiReferences(Isolate* isolate);
+  void AddTaintTracking(Isolate* isolate);
 
   List<ExternalReferenceEntry> refs_;
 

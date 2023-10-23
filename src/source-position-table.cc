@@ -37,6 +37,7 @@ void AddAndSetEntry(PositionTableEntry& value,
   value.code_offset += other.code_offset;
   value.source_position += other.source_position;
   value.is_statement = other.is_statement;
+  value.ast_taint_tracking_index = other.ast_taint_tracking_index;
 }
 
 // Helper: Substract the offsets from 'other' from 'value'.
@@ -70,6 +71,7 @@ void EncodeEntry(ZoneVector<byte>& bytes, const PositionTableEntry& entry) {
   EncodeInt(bytes,
             entry.is_statement ? entry.code_offset : -entry.code_offset - 1);
   EncodeInt(bytes, entry.source_position);
+  EncodeInt(bytes, entry.ast_taint_tracking_index);
 }
 
 // Helper: Decode an integer.
@@ -100,6 +102,7 @@ void DecodeEntry(ByteArray* bytes, int* index, PositionTableEntry* entry) {
     entry->code_offset = -(tmp + 1);
   }
   DecodeInt(bytes, index, &entry->source_position);
+  DecodeInt(bytes, index, &entry->ast_taint_tracking_index);
 }
 
 }  // namespace
@@ -127,10 +130,11 @@ void SourcePositionTableBuilder::EndJitLogging(AbstractCode* code) {
 
 void SourcePositionTableBuilder::AddPosition(size_t code_offset,
                                              int source_position,
-                                             bool is_statement) {
+                                             bool is_statement,
+                                             int ast_taint_tracking_index) {
   if (Omit()) return;
   int offset = static_cast<int>(code_offset);
-  AddEntry({offset, source_position, is_statement});
+  AddEntry({offset, source_position, is_statement, ast_taint_tracking_index});
 }
 
 void SourcePositionTableBuilder::AddEntry(const PositionTableEntry& entry) {

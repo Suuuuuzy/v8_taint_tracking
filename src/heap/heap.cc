@@ -38,6 +38,7 @@
 #include "src/snapshot/natives.h"
 #include "src/snapshot/serializer-common.h"
 #include "src/snapshot/snapshot.h"
+#include "src/taint_tracking.h"
 #include "src/tracing/trace-event.h"
 #include "src/type-feedback-vector.h"
 #include "src/utils.h"
@@ -3672,6 +3673,7 @@ AllocationResult Heap::AllocateInternalizedStringImpl(T t, int chars,
   } else {
     WriteTwoByteData(t, SeqTwoByteString::cast(answer)->GetChars(), chars);
   }
+  tainttracking::InitTaintData(SeqString::cast(answer));
   return answer;
 }
 
@@ -3706,6 +3708,7 @@ AllocationResult Heap::AllocateRawOneByteString(int length,
   String::cast(result)->set_length(length);
   String::cast(result)->set_hash_field(String::kEmptyHashField);
   DCHECK_EQ(size, HeapObject::cast(result)->Size());
+  tainttracking::InitTaintData(SeqOneByteString::cast(result));
 
   return result;
 }
@@ -3730,6 +3733,8 @@ AllocationResult Heap::AllocateRawTwoByteString(int length,
   String::cast(result)->set_length(length);
   String::cast(result)->set_hash_field(String::kEmptyHashField);
   DCHECK_EQ(size, HeapObject::cast(result)->Size());
+  tainttracking::InitTaintData(SeqTwoByteString::cast(result));
+
   return result;
 }
 

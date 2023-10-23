@@ -703,7 +703,12 @@ void MacroAssembler::CallRuntime(const Runtime::Function* f,
   // arguments passed in because it is constant. At some point we
   // should remove this need and make the runtime routine entry code
   // smarter.
-  Set(rax, num_arguments);
+
+  // billy: Added this check to support variable argument number in
+  // builtins-x64.cc
+  if (num_arguments >= 0) {
+    Set(rax, num_arguments);
+  }
   LoadAddress(rbx, ExternalReference(f, isolate()));
   CEntryStub ces(isolate(), f->result_size, save_doubles);
   CallStub(&ces);
@@ -5148,8 +5153,9 @@ void MacroAssembler::AllocateTwoByteString(Register result,
   const int kHeaderAlignment = SeqTwoByteString::kHeaderSize &
                                kObjectAlignmentMask;
   DCHECK(kShortSize == 2);
-  // scratch1 = length * 2 + kObjectAlignmentMask.
-  leap(scratch1, Operand(length, length, times_1, kObjectAlignmentMask +
+  // scratch1 = length * 3 + kObjectAlignmentMask.
+  // Modified to add more for taints
+  leap(scratch1, Operand(length, length, times_2, kObjectAlignmentMask +
                 kHeaderAlignment));
   andp(scratch1, Immediate(~kObjectAlignmentMask));
   if (kHeaderAlignment > 0) {
@@ -5167,6 +5173,13 @@ void MacroAssembler::AllocateTwoByteString(Register result,
   movp(FieldOperand(result, String::kLengthOffset), scratch1);
   movp(FieldOperand(result, String::kHashFieldOffset),
        Immediate(String::kEmptyHashField));
+  // ExternalReference counter_ref(
+  //         tainttracking::TaintTracker::FromIsolate(isolate())->
+  //         symbolic_elem_counter());
+  // Load(scratch1, counter_ref);
+  movp(FieldOperand(result, Name::kTaintInfoOffset),
+       Immediate(Name::DEFAULT_TAINT_INFO));
+  // incl(ExternalOperand(counter_ref));
 }
 
 
@@ -5178,9 +5191,10 @@ void MacroAssembler::AllocateOneByteString(Register result, Register length,
   // observing object alignment.
   const int kHeaderAlignment = SeqOneByteString::kHeaderSize &
                                kObjectAlignmentMask;
-  movl(scratch1, length);
-  DCHECK(kCharSize == 1);
-  addp(scratch1, Immediate(kObjectAlignmentMask + kHeaderAlignment));
+  // scratch1 = length * 2 + kObjectAlignmentMask.
+  // Modified to add more for taints
+  leap(scratch1, Operand(length, length, times_1, kObjectAlignmentMask +
+                kHeaderAlignment));
   andp(scratch1, Immediate(~kObjectAlignmentMask));
   if (kHeaderAlignment > 0) {
     subp(scratch1, Immediate(kHeaderAlignment));
@@ -5197,6 +5211,13 @@ void MacroAssembler::AllocateOneByteString(Register result, Register length,
   movp(FieldOperand(result, String::kLengthOffset), scratch1);
   movp(FieldOperand(result, String::kHashFieldOffset),
        Immediate(String::kEmptyHashField));
+  // ExternalReference counter_ref(
+  //         tainttracking::TaintTracker::FromIsolate(isolate())->
+  //         symbolic_elem_counter());
+  // Load(scratch1, counter_ref);
+  movp(FieldOperand(result, Name::kTaintInfoOffset),
+       Immediate(Name::DEFAULT_TAINT_INFO));
+  // incl(ExternalOperand(counter_ref));
 }
 
 
@@ -5238,6 +5259,14 @@ void MacroAssembler::AllocateTwoByteSlicedString(Register result,
   // Set the map. The other fields are left uninitialized.
   LoadRoot(kScratchRegister, Heap::kSlicedStringMapRootIndex);
   movp(FieldOperand(result, HeapObject::kMapOffset), kScratchRegister);
+
+  // ExternalReference counter_ref(
+  //         tainttracking::TaintTracker::FromIsolate(isolate())->
+  //         symbolic_elem_counter());
+  // Load(scratch1, counter_ref);
+  movp(FieldOperand(result, Name::kTaintInfoOffset),
+       Immediate(Name::DEFAULT_TAINT_INFO));
+  // incl(ExternalOperand(counter_ref));
 }
 
 
@@ -5252,6 +5281,14 @@ void MacroAssembler::AllocateOneByteSlicedString(Register result,
   // Set the map. The other fields are left uninitialized.
   LoadRoot(kScratchRegister, Heap::kSlicedOneByteStringMapRootIndex);
   movp(FieldOperand(result, HeapObject::kMapOffset), kScratchRegister);
+
+  // ExternalReference counter_ref(
+  //         tainttracking::TaintTracker::FromIsolate(isolate())->
+  //         symbolic_elem_counter());
+  // Load(scratch1, counter_ref);
+  movp(FieldOperand(result, Name::kTaintInfoOffset),
+       Immediate(Name::DEFAULT_TAINT_INFO));
+  // incl(ExternalOperand(counter_ref));
 }
 
 

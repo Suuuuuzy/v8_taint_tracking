@@ -20,6 +20,7 @@
 #include "src/runtime-profiler.h"
 #include "src/snapshot/natives.h"
 #include "src/snapshot/snapshot.h"
+#include "src/taint_tracking.h"
 
 
 namespace v8 {

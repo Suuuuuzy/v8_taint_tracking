@@ -823,9 +823,29 @@ RUNTIME_FUNCTION(Runtime_ToObject) {
 
 RUNTIME_FUNCTION(Runtime_ToPrimitive) {
   HandleScope scope(isolate);
-  DCHECK_EQ(1, args.length());
+  int args_length = args.length();
+  DCHECK_LT(0, args_length);
   CONVERT_ARG_HANDLE_CHECKED(Object, input, 0);
-  RETURN_RESULT_OR_FAILURE(isolate, Object::ToPrimitive(input));
+  switch(args_length) {
+    case 1:
+      RETURN_RESULT_OR_FAILURE(isolate, Object::ToPrimitive(input));
+      break;
+
+    case 2: {
+      CONVERT_ARG_HANDLE_CHECKED(Smi, frame_type, 1);
+      RETURN_RESULT_OR_FAILURE(
+          isolate,
+          Object::ToPrimitive(
+              input,
+              ToPrimitiveHint::kDefault,
+              static_cast<tainttracking::FrameType>(frame_type->value())));
+    }
+      break;
+
+    default:
+      UNREACHABLE();
+  }
+  return isolate->heap()->exception();
 }
 
 

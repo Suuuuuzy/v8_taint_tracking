@@ -1130,7 +1130,8 @@ Handle<ByteArray> TranslateSourcePositionTable(
     int position = iterator.source_position();
     int new_position = TranslatePosition(position, position_change_array);
     builder.AddPosition(iterator.code_offset(), new_position,
-                        iterator.is_statement());
+                        iterator.is_statement(),
+                        iterator.ast_taint_tracking_index());
   }
 
   return builder.ToSourcePositionTable();
